@@ -14,6 +14,10 @@ const crypto = require('crypto');
 const { CASStore, sha256 } = require('./lib/cas');
 const { SnapshotEngine, DEFAULT_EXCLUDES } = require('./lib/snapshot');
 const { ExternalBackup } = require('./lib/backup');
+const { diffLines, renderUnified, diffStats } = require('./lib/diff');
+const { parseStructure, structuralDiff, renderStructuralDiff } = require('./lib/markdown-structure');
+const { HistoryEngine } = require('./lib/history');
+const { semanticDiff } = require('./lib/semantic-diff');
 
 // ============================================================
 //  CONFIGURATION
@@ -816,11 +820,16 @@ class VaultScholarPlugin extends Plugin {
         this.mathPhysics = new MathPhysicsEngine(this);
         this.simulation = new SimulationEngine(this);
         this.research = new ResearchEngine(this);
+        this.history = new HistoryEngine(
+            path.join(this.snapshotManager.dataRoot, 'history'),
+            this.snapshotManager.cas
+        );
 
         this.provenance.init();
         this.snapshotManager.init();
         this.rag.init();
         this.sandbox.init();
+        this.history.init();
         this.workingMemory = '';
 
         // Status bar
@@ -837,6 +846,21 @@ class VaultScholarPlugin extends Plugin {
 
         // Settings tab
         this.addSettingTab(new VaultScholarSettingTab(this.app, this));
+
+        // Capture note history on modify (debounced)
+        this._historyDebounce = {};
+        this.registerEvent(this.app.vault.on('modify', (file) => {
+            if (!file.path.endsWith('.md')) return;
+            const now = Date.now();
+            const key = file.path;
+            clearTimeout(this._historyDebounce[key]);
+            this._historyDebounce[key] = setTimeout(async () => {
+                try {
+                    const content = await this.app.vault.cachedRead(file);
+                    this.history.record(file.path, content, 50);
+                } catch (e) { /* ignore */ }
+            }, 2000);
+        }));
 
         // Warm up embeddings
         this.modelManager.ensureEmbeddingsLoaded();
@@ -1009,6 +1033,44 @@ class VaultScholarPlugin extends Plugin {
         });
 
         this.addCommand({
+            id: 'show-note-history',
+            name: 'Show note history & diffs',
+            checkCallback: (checking) => {
+                const file = this.app.workspace.getActiveFile();
+                if (!file || !file.path.endsWith('.md')) return false;
+                if (!checking) {
+                    this.showNoteHistoryModal(file.path);
+                }
+                return true;
+            },
+        });
+
+        this.addCommand({
+            id: 'restore-note-version',
+            name: 'Restore note version',
+            checkCallback: (checking) => {
+                const file = this.app.workspace.getActiveFile();
+                if (!file || !file.path.endsWith('.md')) return false;
+                if (!checking) {
+                    this.promptForInput('♻️ Version number to restore:', async (versionStr) => {
+                        const vNum = parseInt(versionStr, 10);
+                        if (isNaN(vNum)) { new Notice('❌ Invalid version number'); return; }
+                        const version = this.history.getVersion(file.path, vNum);
+                        if (!version) { new Notice('❌ Version not found'); return; }
+                        if (this.settings.vaultWriteApproval) {
+                            const approved = await this.confirmModal('Restore version?', `Overwrite "${file.path}" with version ${vNum}?`);
+                            if (!approved) { new Notice('❌ Restore cancelled'); return; }
+                        }
+                        await this.app.vault.modify(file, version.content);
+                        this.history.record(file.path, version.content, 50);
+                        new Notice(`♻️ Restored version ${vNum}`);
+                    });
+                }
+                return true;
+            },
+        });
+
+        this.addCommand({
             id: 'view-provenance',
             name: 'View provenance records',
             callback: () => {
@@ -1100,6 +1162,94 @@ class VaultScholarPlugin extends Plugin {
             const modal = new ConfirmModal(this.app, title, message, resolve);
             modal.open();
         });
+    }
+
+    /**
+     * Show the note history modal with version actions and diff modes.
+     */
+    async showNoteHistoryModal(notePath) {
+        const versions = this.history.load(notePath);
+        if (versions.length === 0) {
+            new Notice('No history for this note yet. Edit it to capture versions.');
+            return;
+        }
+        // Build version list
+        const lines = versions.slice().reverse().map(v => {
+            return `Version ${v.version} | ${v.timestamp}`;
+        });
+        this.showResultModal(`History: ${notePath}`, lines.join('\n'));
+
+        this.promptForInput('Choose action (view N | diff A B | semantic A B | restore N):', async (cmd) => {
+            await this.handleHistoryCommand(notePath, cmd);
+        });
+    }
+
+    async handleHistoryCommand(notePath, cmd) {
+        const parts = cmd.trim().split(/\s+/);
+        const action = (parts[0] || '').toLowerCase();
+        const versions = this.history.load(notePath);
+
+        if (action === 'view') {
+            const vNum = parseInt(parts[1], 10);
+            const version = this.history.getVersion(notePath, vNum);
+            if (!version) { new Notice('❌ Version not found'); return; }
+            this.showResultModal(`Version ${vNum}`, version.content);
+            return;
+        }
+
+        if (action === 'restore') {
+            const vNum = parseInt(parts[1], 10);
+            const version = this.history.getVersion(notePath, vNum);
+            if (!version) { new Notice('❌ Version not found'); return; }
+            if (this.settings.vaultWriteApproval) {
+                const approved = await this.confirmModal('Restore version?', `Overwrite "${notePath}" with version ${vNum}?`);
+                if (!approved) { new Notice('❌ Restore cancelled'); return; }
+            }
+            const file = this.app.vault.getAbstractFileByPath(notePath);
+            if (file && file.constructor.name === 'TFile') {
+                await this.app.vault.modify(file, version.content);
+                this.history.record(notePath, version.content, 50);
+                new Notice(`♻️ Restored version ${vNum}`);
+            }
+            return;
+        }
+
+        if (action === 'diff' || action === 'semantic') {
+            const aNum = parseInt(parts[parts.length - 2], 10);
+            const bNum = parseInt(parts[parts.length - 1], 10);
+            const a = this.history.getVersion(notePath, aNum);
+            const bv = this.history.getVersion(notePath, bNum);
+            if (!a || !bv) { new Notice('❌ Version not found'); return; }
+
+            if (action === 'diff') {
+                const ops = diffLines(a.content, bv.content);
+                const stats = diffStats(ops);
+                const structured = renderStructuralDiff(
+                    structuralDiff(parseStructure(a.content), parseStructure(bv.content))
+                );
+                const text = `TEXT DIFF (v${aNum} → v${bNum}):\n${renderUnified(ops)}\n\n---STATS---\n+${stats.added} / -${stats.removed}\n\n---STRUCTURAL---\n${structured}`;
+                this.showResultModal(`Diff v${aNum} → v${bNum}`, text);
+            } else {
+                // Semantic diff via LLM (gemma4:12b)
+                new Notice('🧠 Running semantic diff with Gemma4...');
+                const res = await semanticDiff(a.content, bv.content, async (prompt) => {
+                    return this.ollama.generate(MODELS.deep.id, prompt, { numCtx: this.settings.numCtxLong });
+                });
+                let text;
+                if (res.ok) {
+                    text = `CONCEPTUAL CHANGE (v${aNum} → v${bNum})\n\nMeaning: ${res.result.meaning}\nMagnitude: ${res.result.magnitude}\nConfidence: ${res.result.confidence}%\nDescription: ${res.result.description}`;
+                } else {
+                    // Fallback to structural
+                    text = `Semantic diff unavailable (${res.error}). Falling back to structural:\n\n${renderStructuralDiff(
+                        structuralDiff(parseStructure(a.content), parseStructure(bv.content))
+                    )}`;
+                }
+                this.showResultModal(`Semantic Diff v${aNum} → v${bNum}`, text);
+            }
+            return;
+        }
+
+        new Notice('Usage: view N | diff A B | semantic A B | restore N');
     }
 
     openMainModal() {
