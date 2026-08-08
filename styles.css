@@ -1,0 +1,118 @@
+/* ============================================================
+   Vault Scholar — Styles
+   ============================================================ */
+
+/* Main modal */
+.vs-main-modal {
+    max-width: 600px;
+}
+
+.vs-main-modal h2 {
+    margin-bottom: 16px;
+    text-align: center;
+}
+
+.vs-status {
+    background: var(--background-secondary);
+    border-radius: 8px;
+    padding: 12px 16px;
+    margin-bottom: 16px;
+    font-size: 0.9em;
+}
+
+.vs-status p {
+    margin: 4px 0;
+}
+
+.vs-actions {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 8px;
+    margin-bottom: 16px;
+}
+
+.vs-action-btn {
+    padding: 10px 12px;
+    border-radius: 6px;
+    cursor: pointer;
+    text-align: left;
+    font-size: 0.9em;
+    background: var(--background-secondary);
+    border: 1px solid var(--background-modifier-border);
+    transition: background 0.2s;
+}
+
+.vs-action-btn:hover {
+    background: var(--background-modifier-hover);
+}
+
+.vs-close-btn {
+    width: 100%;
+    padding: 8px;
+    border-radius: 6px;
+    cursor: pointer;
+    background: var(--background-secondary);
+    border: 1px solid var(--background-modifier-border);
+}
+
+/* Result modal */
+.vs-result-modal {
+    max-width: 700px;
+}
+
+.vs-result-modal h2 {
+    margin-bottom: 8px;
+}
+
+.vs-citations {
+    background: var(--background-secondary);
+    border-radius: 6px;
+    padding: 8px 12px;
+    margin-bottom: 12px;
+    font-size: 0.85em;
+    word-break: break-all;
+}
+
+.vs-result-content {
+    background: var(--background-secondary);
+    border-radius: 8px;
+    padding: 16px;
+    max-height: 60vh;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    word-wrap: break-word;
+    font-family: var(--font-monospace);
+    font-size: 0.85em;
+    line-height: 1.5;
+}
+
+/* Button rows */
+.vs-btn-row {
+    display: flex;
+    gap: 8px;
+    margin-top: 12px;
+    flex-wrap: wrap;
+}
+
+.vs-btn-row button {
+    padding: 6px 12px;
+    border-radius: 6px;
+    cursor: pointer;
+    background: var(--background-secondary);
+    border: 1px solid var(--background-modifier-border);
+}
+
+.vs-btn-row button:hover {
+    background: var(--background-modifier-hover);
+}
+
+/* Input modal */
+.vs-input-modal textarea {
+    resize: vertical;
+    min-height: 100px;
+}
+
+/* Status bar */
+.status-bar-item {
+    cursor: pointer;
+}

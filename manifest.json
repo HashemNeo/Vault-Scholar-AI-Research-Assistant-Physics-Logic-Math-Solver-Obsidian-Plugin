@@ -1,0 +1,10 @@
+{
+	"id": "vault-scholar",
+	"name": "Vault Scholar",
+	"version": "1.0.0",
+	"minAppVersion": "1.4.0",
+	"description": "Secure research, math/physics derivation, code auditing, and simulation engine powered by local Ollama models. Evidence-gated with provenance, snapshots, and sandboxed execution.",
+	"author": "Vault Scholar",
+	"authorUrl": "",
+	"isDesktopOnly": true
+}

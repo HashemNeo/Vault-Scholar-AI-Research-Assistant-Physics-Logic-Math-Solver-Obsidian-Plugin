@@ -1,0 +1,16 @@
+# Node
+node_modules/
+*.log
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Vault Scholar runtime data (created in the vault, not the repo)
+.vault-scholar/
+assets/
+
+# Editor
+.idea/
+.vscode/
+*.swp
