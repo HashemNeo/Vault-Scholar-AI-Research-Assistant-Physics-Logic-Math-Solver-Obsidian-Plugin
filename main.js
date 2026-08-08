@@ -11,6 +11,9 @@ const { exec, execFile, spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const { CASStore, sha256 } = require('./lib/cas');
+const { SnapshotEngine, DEFAULT_EXCLUDES } = require('./lib/snapshot');
+const { ExternalBackup } = require('./lib/backup');
 
 // ============================================================
 //  CONFIGURATION
@@ -47,6 +50,8 @@ const DEFAULT_SETTINGS = {
     // Snapshots
     autoSnapshotBeforeRisky: true,
     snapshotMaxCount: 20,
+    // External backup
+    externalBackupPath: '',
     // RAG
     ragEnabled: true,
     // Ollama
@@ -281,88 +286,54 @@ class ProvenanceEngine {
 }
 
 // ============================================================
-//  SNAPSHOT MANAGER
+//  SNAPSHOT MANAGER (CAS-backed)
 // ============================================================
 
 class SnapshotManager {
     constructor(plugin) {
         this.plugin = plugin;
-        this.dir = path.join(plugin.assetsDir, 'snapshots');
+        this.vaultRoot = plugin.app.vault.adapter.getBasePath();
+        this.dataRoot = path.join(this.vaultRoot, '.vault-scholar');
+        this.blobsDir = path.join(this.dataRoot, 'blobs');
+        this.snapshotsDir = path.join(this.dataRoot, 'snapshots');
+        this.cas = new CASStore(this.blobsDir);
+        this.engine = new SnapshotEngine(this.vaultRoot, this.snapshotsDir, this.cas);
     }
 
     init() {
-        if (!fs.existsSync(this.dir)) fs.mkdirSync(this.dir, { recursive: true });
+        this.cas.init();
+        this.engine.init();
     }
 
-    async createSnapshot(label = 'manual') {
+    async createSnapshot(label = 'manual', trigger = 'manual') {
         this.init();
-        const vaultPath = this.plugin.app.vault.adapter.getBasePath();
-        const ts = new Date().toISOString().replace(/[:.]/g, '-');
-        const name = `${ts}_${sanitizeFilename(label)}`;
-        const dest = path.join(this.dir, name);
-        fs.mkdirSync(dest, { recursive: true });
-
-        const exclude = new Set(['.obsidian', '.trash', '.git', '.copilot-index', '.megaignore']);
-        const copyRecursive = (src, dst) => {
-            const entries = fs.readdirSync(src, { withFileTypes: true });
-            for (const entry of entries) {
-                if (exclude.has(entry.name)) continue;
-                const srcPath = path.join(src, entry.name);
-                const dstPath = path.join(dst, entry.name);
-                if (entry.isDirectory()) {
-                    fs.mkdirSync(dstPath, { recursive: true });
-                    copyRecursive(srcPath, dstPath);
-                } else {
-                    fs.copyFileSync(srcPath, dstPath);
-                }
-            }
-        };
-        copyRecursive(vaultPath, dest);
-
-        // Prune old snapshots
-        const snapshots = fs.readdirSync(this.dir).filter(f => fs.statSync(path.join(this.dir, f)).isDirectory());
-        const max = this.plugin.settings.snapshotMaxCount;
-        if (snapshots.length > max) {
-            const toRemove = snapshots.sort().slice(0, snapshots.length - max);
-            for (const s of toRemove) {
-                fs.rmSync(path.join(this.dir, s), { recursive: true, force: true });
-            }
-        }
-
-        new Notice(`📸 Snapshot created: ${name}`);
-        return name;
+        const snap = this.engine.create(label, trigger);
+        // Prune
+        this.engine.prune(this.plugin.settings.snapshotMaxCount);
+        new Notice(`📸 Snapshot created: ${snap.label || snap.id} (${snap.fileCount} files)`);
+        return snap;
     }
 
     listSnapshots() {
-        if (!fs.existsSync(this.dir)) return [];
-        return fs.readdirSync(this.dir).filter(f => fs.statSync(path.join(this.dir, f)).isDirectory()).sort().reverse();
+        this.init();
+        return this.engine.list().map(s => `${s.timestamp} | ${s.label || 'manual'} | ${s.fileCount} files | ${s.id}`);
     }
 
-    async restoreSnapshot(name) {
-        const src = path.join(this.dir, name);
-        if (!fs.existsSync(src)) {
-            new Notice('❌ Snapshot not found');
+    async restoreSnapshot(nameOrId) {
+        this.init();
+        // nameOrId may be a full display string; extract id or match by label
+        let id = nameOrId;
+        const list = this.engine.list();
+        const match = list.find(s => s.id === nameOrId || (s.label && s.label === nameOrId));
+        if (match) id = match.id;
+        const result = this.engine.restore(id);
+        if (result.ok) {
+            new Notice(`♻️ Restored snapshot: restored ${result.restored}/${result.total} files`);
+            return true;
+        } else {
+            new Notice(`❌ ${result.error}`);
             return false;
         }
-        const vaultPath = this.plugin.app.vault.adapter.getBasePath();
-        const exclude = new Set(['.obsidian', '.trash', '.git', '.copilot-index']);
-        const copyRecursive = (srcDir, dstDir) => {
-            const entries = fs.readdirSync(srcDir, { withFileTypes: true });
-            for (const entry of entries) {
-                if (exclude.has(entry.name)) continue;
-                const srcPath = path.join(srcDir, entry.name);
-                const dstPath = path.join(dstDir, entry.name);
-                if (entry.isDirectory()) {
-                    fs.mkdirSync(dstPath, { recursive: true });
-                    copyRecursive(srcPath, dstPath);
-                } else {
-                    fs.copyFileSync(srcPath, dstPath);
-                }
-            }
-        };
-        copyRecursive(src, vaultPath);
-        new Notice(`♻️ Restored snapshot: ${name}`);
-        return true;
     }
 }
 
@@ -1022,6 +993,22 @@ class VaultScholarPlugin extends Plugin {
         });
 
         this.addCommand({
+            id: 'run-external-backup',
+            name: 'Run external vault backup',
+            callback: async () => {
+                const backupPath = this.settings.externalBackupPath;
+                if (!backupPath) {
+                    new Notice('❌ No external backup path configured. Set it in Vault Scholar settings.');
+                    return;
+                }
+                const vaultRoot = this.app.vault.adapter.getBasePath();
+                const backup = new ExternalBackup(vaultRoot, backupPath);
+                const stats = backup.run();
+                new Notice(`💾 Backup complete: ${stats.copied} copied, ${stats.skipped} unchanged, ${stats.errors} errors`);
+            },
+        });
+
+        this.addCommand({
             id: 'view-provenance',
             name: 'View provenance records',
             callback: () => {
@@ -1483,6 +1470,20 @@ class VaultScholarSettingTab extends PluginSettingTab {
                 .setDynamicTooltip()
                 .onChange(async v => {
                     this.plugin.settings.snapshotMaxCount = v;
+                    await this.plugin.saveSettings();
+                }));
+
+        // ===== External Backup =====
+        containerEl.createEl('h3', { text: '💾 External Backup' });
+
+        new Setting(containerEl)
+            .setName('External backup path')
+            .setDesc('Directory outside the vault for Layer-1 backups (e.g. D:\\Obsidian-Backups\\MyVault)')
+            .addText(t => t
+                .setPlaceholder('D:\\Obsidian-Backups\\MyVault')
+                .setValue(this.plugin.settings.externalBackupPath)
+                .onChange(async v => {
+                    this.plugin.settings.externalBackupPath = v;
                     await this.plugin.saveSettings();
                 }));
 
