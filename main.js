@@ -11,13 +11,9 @@ const { exec, execFile, spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const { CASStore, sha256 } = require('./lib/cas');
-const { SnapshotEngine, DEFAULT_EXCLUDES } = require('./lib/snapshot');
-const { ExternalBackup } = require('./lib/backup');
-const { diffLines, renderUnified, diffStats } = require('./lib/diff');
-const { parseStructure, structuralDiff, renderStructuralDiff } = require('./lib/markdown-structure');
-const { HistoryEngine } = require('./lib/history');
-const { semanticDiff } = require('./lib/semantic-diff');
+const { TRUST_LEVELS, CONTENT_SOURCES, TrustClassifier, TrustBoundary } = require('./lib/trust');
+const { EvidenceGate, CLAIM_ORIGIN, EVIDENCE_MARKERS } = require('./lib/evidence');
+const { ResearchMode, SourceClassifier, SOURCE_TRUST } = require('./lib/research');
 
 // ============================================================
 //  CONFIGURATION
@@ -42,6 +38,10 @@ const DEFAULT_SETTINGS = {
     scriptExecutionApproval: true,
     verifyExternalBeforeWrite: true,
     sandboxMode: 'python', // 'python' | 'node' | 'docker'
+    // Trust Boundary
+    trustEnforcement: true,
+    trustThreshold: TRUST_LEVELS.VERIFIED,
+    trustDisplay: true,
     // Models
     activeModel: MODELS.safe.id,
     // Context
@@ -54,10 +54,18 @@ const DEFAULT_SETTINGS = {
     // Snapshots
     autoSnapshotBeforeRisky: true,
     snapshotMaxCount: 20,
-    // External backup
-    externalBackupPath: '',
     // RAG
     ragEnabled: true,
+    // Evidence-Gated Knowledge
+    evidenceGating: true,
+    // Research Mode
+    researchModeEnabled: true,
+    searchProvider: 'duckduckgo',
+    searxngUrl: '',
+    searxngCategories: 'general',
+    searxngMaxResults: 10,
+    maxSources: 5,
+    maxSearchResults: 10,
     // Ollama
     ollamaHost: OLLAMA_HOST,
 };
@@ -260,6 +268,16 @@ class ProvenanceEngine {
     async record(entry) {
         if (!this.plugin.settings.provenanceEnabled) return;
         this.init();
+        // Classify trust for this record
+        const trust = TrustClassifier.classify(entry.content || '', {
+            source: entry.contentSource || CONTENT_SOURCES.AI_GENERATED,
+            trustLevel: entry.trustLevel,
+            verifiedBy: entry.verifiedBy,
+            confidence: entry.confidence,
+            citations: entry.citations || [],
+            model: entry.model || this.plugin.modelManager.activeModel,
+            metadata: entry.metadata || {},
+        });
         const record = {
             id: hashString(nowISO() + Math.random()),
             timestamp: nowISO(),
@@ -268,10 +286,15 @@ class ProvenanceEngine {
             sourceNote: entry.sourceNote || null,
             model: entry.model || this.plugin.modelManager.activeModel,
             citations: entry.citations || [],
-            verified: entry.verified ?? false,
+            verified: entry.verified ?? trust.verified,
             verificationMethod: entry.verificationMethod || null,
             hash: hashString(entry.content || ''),
             metadata: entry.metadata || {},
+            // Trust Boundary metadata
+            trustLevel: trust.trustLevel,
+            contentSource: trust.contentSource,
+            confidence: trust.confidence,
+            verifiedBy: trust.verifiedBy,
         };
         fs.appendFileSync(this.logFile, JSON.stringify(record) + '\n');
         return record;
@@ -290,54 +313,88 @@ class ProvenanceEngine {
 }
 
 // ============================================================
-//  SNAPSHOT MANAGER (CAS-backed)
+//  SNAPSHOT MANAGER
 // ============================================================
 
 class SnapshotManager {
     constructor(plugin) {
         this.plugin = plugin;
-        this.vaultRoot = plugin.app.vault.adapter.getBasePath();
-        this.dataRoot = path.join(this.vaultRoot, '.vault-scholar');
-        this.blobsDir = path.join(this.dataRoot, 'blobs');
-        this.snapshotsDir = path.join(this.dataRoot, 'snapshots');
-        this.cas = new CASStore(this.blobsDir);
-        this.engine = new SnapshotEngine(this.vaultRoot, this.snapshotsDir, this.cas);
+        this.dir = path.join(plugin.assetsDir, 'snapshots');
     }
 
     init() {
-        this.cas.init();
-        this.engine.init();
+        if (!fs.existsSync(this.dir)) fs.mkdirSync(this.dir, { recursive: true });
     }
 
-    async createSnapshot(label = 'manual', trigger = 'manual') {
+    async createSnapshot(label = 'manual') {
         this.init();
-        const snap = this.engine.create(label, trigger);
-        // Prune
-        this.engine.prune(this.plugin.settings.snapshotMaxCount);
-        new Notice(`📸 Snapshot created: ${snap.label || snap.id} (${snap.fileCount} files)`);
-        return snap;
+        const vaultPath = this.plugin.app.vault.adapter.getBasePath();
+        const ts = new Date().toISOString().replace(/[:.]/g, '-');
+        const name = `${ts}_${sanitizeFilename(label)}`;
+        const dest = path.join(this.dir, name);
+        fs.mkdirSync(dest, { recursive: true });
+
+        const exclude = new Set(['.obsidian', '.trash', '.git', '.copilot-index', '.megaignore']);
+        const copyRecursive = (src, dst) => {
+            const entries = fs.readdirSync(src, { withFileTypes: true });
+            for (const entry of entries) {
+                if (exclude.has(entry.name)) continue;
+                const srcPath = path.join(src, entry.name);
+                const dstPath = path.join(dst, entry.name);
+                if (entry.isDirectory()) {
+                    fs.mkdirSync(dstPath, { recursive: true });
+                    copyRecursive(srcPath, dstPath);
+                } else {
+                    fs.copyFileSync(srcPath, dstPath);
+                }
+            }
+        };
+        copyRecursive(vaultPath, dest);
+
+        // Prune old snapshots
+        const snapshots = fs.readdirSync(this.dir).filter(f => fs.statSync(path.join(this.dir, f)).isDirectory());
+        const max = this.plugin.settings.snapshotMaxCount;
+        if (snapshots.length > max) {
+            const toRemove = snapshots.sort().slice(0, snapshots.length - max);
+            for (const s of toRemove) {
+                fs.rmSync(path.join(this.dir, s), { recursive: true, force: true });
+            }
+        }
+
+        new Notice(`📸 Snapshot created: ${name}`);
+        return name;
     }
 
     listSnapshots() {
-        this.init();
-        return this.engine.list().map(s => `${s.timestamp} | ${s.label || 'manual'} | ${s.fileCount} files | ${s.id}`);
+        if (!fs.existsSync(this.dir)) return [];
+        return fs.readdirSync(this.dir).filter(f => fs.statSync(path.join(this.dir, f)).isDirectory()).sort().reverse();
     }
 
-    async restoreSnapshot(nameOrId) {
-        this.init();
-        // nameOrId may be a full display string; extract id or match by label
-        let id = nameOrId;
-        const list = this.engine.list();
-        const match = list.find(s => s.id === nameOrId || (s.label && s.label === nameOrId));
-        if (match) id = match.id;
-        const result = this.engine.restore(id);
-        if (result.ok) {
-            new Notice(`♻️ Restored snapshot: restored ${result.restored}/${result.total} files`);
-            return true;
-        } else {
-            new Notice(`❌ ${result.error}`);
+    async restoreSnapshot(name) {
+        const src = path.join(this.dir, name);
+        if (!fs.existsSync(src)) {
+            new Notice('❌ Snapshot not found');
             return false;
         }
+        const vaultPath = this.plugin.app.vault.adapter.getBasePath();
+        const exclude = new Set(['.obsidian', '.trash', '.git', '.copilot-index']);
+        const copyRecursive = (srcDir, dstDir) => {
+            const entries = fs.readdirSync(srcDir, { withFileTypes: true });
+            for (const entry of entries) {
+                if (exclude.has(entry.name)) continue;
+                const srcPath = path.join(srcDir, entry.name);
+                const dstPath = path.join(dstDir, entry.name);
+                if (entry.isDirectory()) {
+                    fs.mkdirSync(dstPath, { recursive: true });
+                    copyRecursive(srcPath, dstPath);
+                } else {
+                    fs.copyFileSync(srcPath, dstPath);
+                }
+            }
+        };
+        copyRecursive(src, vaultPath);
+        new Notice(`♻️ Restored snapshot: ${name}`);
+        return true;
     }
 }
 
@@ -622,6 +679,8 @@ DERIVATION:`;
             content: result,
             sourceNote: opts.sourceNote || null,
             model: modelId,
+            contentSource: CONTENT_SOURCES.MATH_DERIVED,
+            trustLevel: TRUST_LEVELS.INFERRED,
             metadata: { problem },
         });
 
@@ -653,6 +712,8 @@ ANALYSIS:`;
             content: result,
             sourceNote: opts.sourceNote || null,
             model: modelId,
+            contentSource: CONTENT_SOURCES.AI_GENERATED,
+            trustLevel: TRUST_LEVELS.INFERRED,
             metadata: { input },
         });
 
@@ -697,6 +758,8 @@ SPECIFICATION:`;
             content: result,
             sourceNote: opts.sourceNote || null,
             model: modelId,
+            contentSource: CONTENT_SOURCES.AI_GENERATED,
+            trustLevel: TRUST_LEVELS.INFERRED,
             metadata: { description },
         });
 
@@ -731,6 +794,8 @@ SCRIPT:`;
             content: code,
             sourceNote: opts.sourceNote || null,
             model: modelId,
+            contentSource: CONTENT_SOURCES.CODE_GENERATED,
+            trustLevel: TRUST_LEVELS.UNVERIFIED,
             metadata: { spec, language },
         });
 
@@ -789,6 +854,8 @@ RESEARCH:`;
             citations,
             verified: !opts.externalSources,
             verificationMethod: opts.externalSources ? 'needs_verification' : 'vault_context_only',
+            contentSource: opts.externalSources ? CONTENT_SOURCES.EXTERNAL_SOURCED : CONTENT_SOURCES.AI_GENERATED,
+            trustLevel: opts.externalSources ? TRUST_LEVELS.UNVERIFIED : (citations.length > 0 ? TRUST_LEVELS.VERIFIED : TRUST_LEVELS.INFERRED),
             metadata: { topic },
         });
 
@@ -820,16 +887,47 @@ class VaultScholarPlugin extends Plugin {
         this.mathPhysics = new MathPhysicsEngine(this);
         this.simulation = new SimulationEngine(this);
         this.research = new ResearchEngine(this);
-        this.history = new HistoryEngine(
-            path.join(this.snapshotManager.dataRoot, 'history'),
-            this.snapshotManager.cas
-        );
+        // Trust Boundary
+        this.trustBoundary = new TrustBoundary({
+            enabled: this.settings.trustEnforcement,
+            onDecision: (decision) => {
+                // Log trust decisions to provenance
+                this.provenance.record({
+                    type: 'trust_decision',
+                    content: `${decision.operation}: ${decision.allowed ? 'ALLOWED' : 'BLOCKED'} (${decision.level} vs ${decision.required})`,
+                    contentSource: CONTENT_SOURCES.AI_GENERATED,
+                    trustLevel: decision.level,
+                    verifiedBy: 'trust_boundary',
+                    metadata: { decision },
+                });
+            },
+        });
+
+        // Research Mode (uses trustBoundary)
+        this.researchMode = new ResearchMode({
+            createFetcher: () => async (url) => {
+                const res = await requestUrl({ url, throw: false });
+                if (res.status >= 400) throw new Error('HTTP ' + res.status);
+                return res.text;
+            },
+            generate: (model, prompt, opts) => this.ollama.generate(model, prompt, opts),
+            modelId: MODELS.deep.id,
+            settings: {
+                searchProvider: this.settings.searchProvider,
+                searxngUrl: this.settings.searxngUrl,
+                searxngCategories: this.settings.searxngCategories,
+                searxngMaxResults: this.settings.searxngMaxResults,
+                maxSources: this.settings.maxSources,
+                maxSearchResults: this.settings.maxSearchResults,
+                numCtxLong: this.settings.numCtxLong,
+            },
+            trustBoundary: this.trustBoundary,
+        });
 
         this.provenance.init();
         this.snapshotManager.init();
         this.rag.init();
         this.sandbox.init();
-        this.history.init();
         this.workingMemory = '';
 
         // Status bar
@@ -846,21 +944,6 @@ class VaultScholarPlugin extends Plugin {
 
         // Settings tab
         this.addSettingTab(new VaultScholarSettingTab(this.app, this));
-
-        // Capture note history on modify (debounced)
-        this._historyDebounce = {};
-        this.registerEvent(this.app.vault.on('modify', (file) => {
-            if (!file.path.endsWith('.md')) return;
-            const now = Date.now();
-            const key = file.path;
-            clearTimeout(this._historyDebounce[key]);
-            this._historyDebounce[key] = setTimeout(async () => {
-                try {
-                    const content = await this.app.vault.cachedRead(file);
-                    this.history.record(file.path, content, 50);
-                } catch (e) { /* ignore */ }
-            }, 2000);
-        }));
 
         // Warm up embeddings
         this.modelManager.ensureEmbeddingsLoaded();
@@ -898,6 +981,114 @@ class VaultScholarPlugin extends Plugin {
                 const { result, citations } = await this.research.research(topic);
                 this.showResultModal('Research Results', result, citations);
             }),
+        });
+
+        this.addCommand({
+            id: 'research-mode',
+            name: 'Research this (Research Mode)',
+            callback: () => this.promptForInput('🔎 Research this (Research Mode):', async (question) => {
+                if (!this.settings.internetResearch) {
+                    new Notice('⚠️ Internet Research is OFF. Enable it in Settings → Vault Scholar.');
+                    return;
+                }
+                if (!this.settings.researchModeEnabled) {
+                    new Notice('⚠️ Research Mode is disabled in settings.');
+                    return;
+                }
+                const stageNames = [];
+                const state = await this.researchMode.research(question, {
+                    onStage: (name) => { stageNames.push(name); new Notice('🔬 Stage: ' + name); },
+                });
+                await this.provenance.record({
+                    type: 'research_mode',
+                    content: state.answer || state.vaultProposal,
+                    contentSource: CONTENT_SOURCES.EXTERNAL_SOURCED,
+                    trustLevel: TRUST_LEVELS.VERIFIED,
+                    citations: state.citations,
+                    verificationMethod: 'research_mode_pipeline',
+                    metadata: { question, stages: stageNames, contradictions: state.contradictions.length },
+                });
+                this.showResultModal('Research Mode Results', state.vaultProposal, state.citations);
+            }),
+        });
+
+        this.addCommand({
+            id: 'gate-content',
+            name: 'Gate active note with Evidence-Gated Knowledge',
+            callback: () => {
+                const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+                if (!view) { new Notice('❌ No active note'); return; }
+                const report = EvidenceGate.validateNote(view.editor.getValue());
+                const text =
+                    '🛡️ EVIDENCE GATE REPORT\n' +
+                    '=========================\n\n' +
+                    'Valid: ' + (report.valid ? '✅ YES' : '❌ NO') + '\n' +
+                    'Total claims: ' + report.totalClaims + '\n' +
+                    'Allowed: ' + report.allowed + '\n' +
+                    'Blocked: ' + report.blocked + '\n\n' +
+                    'Origins:\n' +
+                    Object.entries(report.summary.origins || {}).map(([k, v]) => '  ' + k + ': ' + v).join('\n') +
+                    '\n\nTrust levels:\n' +
+                    Object.entries(report.summary.trust || {}).map(([k, v]) => '  ' + k + ': ' + v).join('\n') +
+                    (report.issues.length > 0
+                        ? '\n\n🚫 Blocked claims:\n' + report.issues.map(i => '- ' + i.text + '\n  → ' + i.reason).join('\n')
+                        : '');
+                this.showResultModal('Evidence Gate Report', text);
+            },
+        });
+
+        this.addCommand({
+            id: 'lint-evidence',
+            name: 'Lint vault for evidence',
+            callback: async () => {
+                const files = this.app.vault.getMarkdownFiles();
+                let total = 0, blocked = 0, ok = 0;
+                const details = [];
+                for (const file of files) {
+                    const content = await this.app.vault.cachedRead(file);
+                    const report = EvidenceGate.validateNote(content);
+                    total += report.totalClaims;
+                    blocked += report.blocked;
+                    if (report.blocked > 0) {
+                        details.push(file.path + ': ' + report.blocked + ' blocked');
+                    } else {
+                        ok++;
+                    }
+                }
+                const text =
+                    '🔍 VAULT EVIDENCE LINT\n' +
+                    '======================\n\n' +
+                    'Files: ' + files.length + '\n' +
+                    'Total claims: ' + total + '\n' +
+                    'Blocked: ' + blocked + '\n' +
+                    'Files with issues: ' + details.length + '\n\n' +
+                    (details.length > 0 ? details.join('\n') : '✅ No unsourced external claims detected');
+                this.showResultModal('Vault Evidence Lint', text);
+            },
+        });
+
+        this.addCommand({
+            id: 'format-simulation',
+            name: 'Format simulation result header',
+            callback: () => {
+                const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+                const header = EvidenceGate.simulationHeader(
+                    'Unspecified model',
+                    ['(none stated)'],
+                    '(none stated)',
+                    'Unspecified'
+                );
+                if (!view) {
+                    this.showResultModal('Simulation Header Template', header);
+                    new Notice('💡 No active note — header copied to result modal');
+                    return;
+                }
+                const editor = view.editor;
+                const doc = editor.getDoc();
+                const cursor = doc.getCursor();
+                doc.replaceRange(header + '\n\n', cursor);
+                new Notice('✅ Simulation header inserted');
+            },
         });
 
         this.addCommand({
@@ -1017,60 +1208,6 @@ class VaultScholarPlugin extends Plugin {
         });
 
         this.addCommand({
-            id: 'run-external-backup',
-            name: 'Run external vault backup',
-            callback: async () => {
-                const backupPath = this.settings.externalBackupPath;
-                if (!backupPath) {
-                    new Notice('❌ No external backup path configured. Set it in Vault Scholar settings.');
-                    return;
-                }
-                const vaultRoot = this.app.vault.adapter.getBasePath();
-                const backup = new ExternalBackup(vaultRoot, backupPath);
-                const stats = backup.run();
-                new Notice(`💾 Backup complete: ${stats.copied} copied, ${stats.skipped} unchanged, ${stats.errors} errors`);
-            },
-        });
-
-        this.addCommand({
-            id: 'show-note-history',
-            name: 'Show note history & diffs',
-            checkCallback: (checking) => {
-                const file = this.app.workspace.getActiveFile();
-                if (!file || !file.path.endsWith('.md')) return false;
-                if (!checking) {
-                    this.showNoteHistoryModal(file.path);
-                }
-                return true;
-            },
-        });
-
-        this.addCommand({
-            id: 'restore-note-version',
-            name: 'Restore note version',
-            checkCallback: (checking) => {
-                const file = this.app.workspace.getActiveFile();
-                if (!file || !file.path.endsWith('.md')) return false;
-                if (!checking) {
-                    this.promptForInput('♻️ Version number to restore:', async (versionStr) => {
-                        const vNum = parseInt(versionStr, 10);
-                        if (isNaN(vNum)) { new Notice('❌ Invalid version number'); return; }
-                        const version = this.history.getVersion(file.path, vNum);
-                        if (!version) { new Notice('❌ Version not found'); return; }
-                        if (this.settings.vaultWriteApproval) {
-                            const approved = await this.confirmModal('Restore version?', `Overwrite "${file.path}" with version ${vNum}?`);
-                            if (!approved) { new Notice('❌ Restore cancelled'); return; }
-                        }
-                        await this.app.vault.modify(file, version.content);
-                        this.history.record(file.path, version.content, 50);
-                        new Notice(`♻️ Restored version ${vNum}`);
-                    });
-                }
-                return true;
-            },
-        });
-
-        this.addCommand({
             id: 'view-provenance',
             name: 'View provenance records',
             callback: () => {
@@ -1115,6 +1252,56 @@ class VaultScholarPlugin extends Plugin {
                 const text = models.map(m => `- ${m.name} (${(m.size_vram / 1e9).toFixed(1)} GB VRAM)`).join('\n');
                 this.showResultModal('Loaded Models (VRAM)', text);
             },
+        });
+
+        this.addCommand({
+            id: 'classify-note',
+            name: 'Classify current note trust level',
+            callback: () => {
+                const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+                if (!view) {
+                    new Notice('❌ No active note open');
+                    return;
+                }
+                const content = view.editor.getValue();
+                const record = TrustClassifier.classify(content, {
+                    source: CONTENT_SOURCES.USER_CREATED,
+                    trustLevel: TRUST_LEVELS.TRUSTED,
+                    verifiedBy: 'user',
+                });
+                new Notice(`🛡️ Note classified: ${record.trustLevel} (${record.contentSource})`);
+                this.showResultModal('Trust Classification', 
+                    `TRUST LEVEL: ${record.trustLevel}\n` +
+                    `CONTENT SOURCE: ${record.contentSource}\n` +
+                    `CONFIDENCE: ${record.confidence}%\n` +
+                    `VERIFIED: ${record.verified}\n` +
+                    `VERIFIED BY: ${record.verifiedBy}\n` +
+                    `HASH: ${record.hash.slice(0, 16)}…`
+                );
+            },
+        });
+
+        this.addCommand({
+            id: 'view-trust',
+            name: 'View trust boundary status',
+            callback: () => {
+                const trail = this.trustBoundary.auditTrail();
+                const status = 
+                    `TRUST BOUNDARY: ${this.settings.trustEnforcement ? 'ACTIVE 🛡️' : 'DISABLED'}\n` +
+                    `THRESHOLD: ${this.settings.trustThreshold}\n\n` +
+                    `DECISIONS LOGGED: ${trail.length}\n\n` +
+                    (trail.length > 0 ? trail.slice(-10).reverse().map(d =>
+                        `${d.timestamp} — ${d.operation}: ${d.allowed ? '✅ ALLOWED' : '🚫 BLOCKED'} ` +
+                        `(${d.level} → required ${d.required})`
+                    ).join('\n') : 'No trust decisions yet.');
+                this.showResultModal('Trust Boundary Status', status);
+            },
+        });
+
+        this.addCommand({
+            id: 'trust-audit',
+            name: 'Run trust audit across vault',
+            callback: () => this.trustAudit(),
         });
 
         this.addCommand({
@@ -1164,94 +1351,6 @@ class VaultScholarPlugin extends Plugin {
         });
     }
 
-    /**
-     * Show the note history modal with version actions and diff modes.
-     */
-    async showNoteHistoryModal(notePath) {
-        const versions = this.history.load(notePath);
-        if (versions.length === 0) {
-            new Notice('No history for this note yet. Edit it to capture versions.');
-            return;
-        }
-        // Build version list
-        const lines = versions.slice().reverse().map(v => {
-            return `Version ${v.version} | ${v.timestamp}`;
-        });
-        this.showResultModal(`History: ${notePath}`, lines.join('\n'));
-
-        this.promptForInput('Choose action (view N | diff A B | semantic A B | restore N):', async (cmd) => {
-            await this.handleHistoryCommand(notePath, cmd);
-        });
-    }
-
-    async handleHistoryCommand(notePath, cmd) {
-        const parts = cmd.trim().split(/\s+/);
-        const action = (parts[0] || '').toLowerCase();
-        const versions = this.history.load(notePath);
-
-        if (action === 'view') {
-            const vNum = parseInt(parts[1], 10);
-            const version = this.history.getVersion(notePath, vNum);
-            if (!version) { new Notice('❌ Version not found'); return; }
-            this.showResultModal(`Version ${vNum}`, version.content);
-            return;
-        }
-
-        if (action === 'restore') {
-            const vNum = parseInt(parts[1], 10);
-            const version = this.history.getVersion(notePath, vNum);
-            if (!version) { new Notice('❌ Version not found'); return; }
-            if (this.settings.vaultWriteApproval) {
-                const approved = await this.confirmModal('Restore version?', `Overwrite "${notePath}" with version ${vNum}?`);
-                if (!approved) { new Notice('❌ Restore cancelled'); return; }
-            }
-            const file = this.app.vault.getAbstractFileByPath(notePath);
-            if (file && file.constructor.name === 'TFile') {
-                await this.app.vault.modify(file, version.content);
-                this.history.record(notePath, version.content, 50);
-                new Notice(`♻️ Restored version ${vNum}`);
-            }
-            return;
-        }
-
-        if (action === 'diff' || action === 'semantic') {
-            const aNum = parseInt(parts[parts.length - 2], 10);
-            const bNum = parseInt(parts[parts.length - 1], 10);
-            const a = this.history.getVersion(notePath, aNum);
-            const bv = this.history.getVersion(notePath, bNum);
-            if (!a || !bv) { new Notice('❌ Version not found'); return; }
-
-            if (action === 'diff') {
-                const ops = diffLines(a.content, bv.content);
-                const stats = diffStats(ops);
-                const structured = renderStructuralDiff(
-                    structuralDiff(parseStructure(a.content), parseStructure(bv.content))
-                );
-                const text = `TEXT DIFF (v${aNum} → v${bNum}):\n${renderUnified(ops)}\n\n---STATS---\n+${stats.added} / -${stats.removed}\n\n---STRUCTURAL---\n${structured}`;
-                this.showResultModal(`Diff v${aNum} → v${bNum}`, text);
-            } else {
-                // Semantic diff via LLM (gemma4:12b)
-                new Notice('🧠 Running semantic diff with Gemma4...');
-                const res = await semanticDiff(a.content, bv.content, async (prompt) => {
-                    return this.ollama.generate(MODELS.deep.id, prompt, { numCtx: this.settings.numCtxLong });
-                });
-                let text;
-                if (res.ok) {
-                    text = `CONCEPTUAL CHANGE (v${aNum} → v${bNum})\n\nMeaning: ${res.result.meaning}\nMagnitude: ${res.result.magnitude}\nConfidence: ${res.result.confidence}%\nDescription: ${res.result.description}`;
-                } else {
-                    // Fallback to structural
-                    text = `Semantic diff unavailable (${res.error}). Falling back to structural:\n\n${renderStructuralDiff(
-                        structuralDiff(parseStructure(a.content), parseStructure(bv.content))
-                    )}`;
-                }
-                this.showResultModal(`Semantic Diff v${aNum} → v${bNum}`, text);
-            }
-            return;
-        }
-
-        new Notice('Usage: view N | diff A B | semantic A B | restore N');
-    }
-
     openMainModal() {
         const modal = new MainModal(this.app, this);
         modal.open();
@@ -1263,6 +1362,42 @@ class VaultScholarPlugin extends Plugin {
 
     async saveSettings() {
         await this.saveData(this.settings);
+    }
+
+    async trustAudit() {
+        const files = this.app.vault.getMarkdownFiles();
+        let trusted = 0, verified = 0, inferred = 0, unverified = 0;
+        const breakdown = {};
+
+        for (const file of files) {
+            const content = await this.app.vault.cachedRead(file);
+            const record = TrustClassifier.classify(content, {
+                source: CONTENT_SOURCES.USER_CREATED,
+                trustLevel: TRUST_LEVELS.TRUSTED,
+                verifiedBy: 'user',
+            });
+            switch (record.trustLevel) {
+                case TRUST_LEVELS.TRUSTED: trusted++; break;
+                case TRUST_LEVELS.VERIFIED: verified++; break;
+                case TRUST_LEVELS.INFERRED: inferred++; break;
+                default: unverified++; break;
+            }
+            breakdown[record.trustLevel] = (breakdown[record.trustLevel] || 0) + 1;
+        }
+
+        const text =
+            `🔒 TRUST AUDIT\n` +
+            `=============\n\n` +
+            `📊 Total notes: ${files.length}\n\n` +
+            `🛡️ TRUSTED:   ${trusted}\n` +
+            `✅ VERIFIED:  ${verified}\n` +
+            `🧠 INFERRED:  ${inferred}\n` +
+            `⚠️ UNVERIFIED: ${unverified}\n\n` +
+            `Source breakdown:\n` +
+            Object.entries(breakdown).map(([k, v]) => `  ${k}: ${v}`).join('\n') +
+            `\n\nTrust boundary ${this.settings.trustEnforcement ? 'ACTIVE' : 'DISABLED'}`;
+
+        this.showResultModal('Trust Audit', text);
     }
 }
 
@@ -1427,6 +1562,7 @@ class MainModal extends Modal {
         status.createEl('p', { text: `Internet Research: ${this.plugin.settings.internetResearch ? 'ON' : 'OFF'}` });
         status.createEl('p', { text: `Vault Write Approval: ${this.plugin.settings.vaultWriteApproval ? 'REQUIRED' : 'AUTO'}` });
         status.createEl('p', { text: `Script Execution Approval: ${this.plugin.settings.scriptExecutionApproval ? 'REQUIRED' : 'AUTO'}` });
+        status.createEl('p', { text: `Trust Boundary: ${this.plugin.settings.trustEnforcement ? '🛡️ ACTIVE' : '⚠️ DISABLED'} (${this.plugin.settings.trustThreshold})` });
 
         const actions = contentEl.createDiv({ cls: 'vs-actions' });
         const actionsList = [
@@ -1441,7 +1577,11 @@ class MainModal extends Modal {
             ['📸 Snapshot', 'create-snapshot'],
             ['♻️ Restore', 'restore-snapshot'],
             ['📜 Provenance', 'view-provenance'],
-            ['🧠 Switch Model', 'switch-model'],
+            ['🛡️ Trust Status', 'view-trust'],
+            ['🔒 Trust Audit', 'trust-audit'],
+            ['🔬 Research Mode', 'research-mode'],
+            ['🛡️ Evidence Gate', 'gate-content'],
+            ['🧠 Switch Model', 'switch-model'],            ['🧠 Switch Model', 'switch-model'],
         ];
         for (const [label, cmdId] of actionsList) {
             const btn = actions.createEl('button', { text: label, cls: 'vs-action-btn' });
@@ -1516,6 +1656,40 @@ class VaultScholarSettingTab extends PluginSettingTab {
             .setDesc('Verify external sources before writing to vault')
             .addToggle(t => t.setValue(this.plugin.settings.verifyExternalBeforeWrite).onChange(async v => {
                 this.plugin.settings.verifyExternalBeforeWrite = v;
+                await this.plugin.saveSettings();
+            }));
+
+        // ===== Trust Boundary =====
+        containerEl.createEl('h3', { text: '🛡️ Trust Boundary' });
+
+        new Setting(containerEl)
+            .setName('Enable Trust Enforcement')
+            .setDesc('Enforce trust levels on vault operations. Unverified AI output cannot silently overwrite trusted content.')
+            .addToggle(t => t.setValue(this.plugin.settings.trustEnforcement).onChange(async v => {
+                this.plugin.settings.trustEnforcement = v;
+                this.plugin.trustBoundary.enabled = v;
+                await this.plugin.saveSettings();
+            }));
+
+        new Setting(containerEl)
+            .setName('Trust Threshold')
+            .setDesc('Minimum trust level required for automatic operations')
+            .addDropdown(d => d
+                .addOption(TRUST_LEVELS.TRUSTED, '🛡️ TRUSTED — User verified only')
+                .addOption(TRUST_LEVELS.VERIFIED, '✅ VERIFIED — Cross-checked with citations')
+                .addOption(TRUST_LEVELS.INFERRED, '🧠 INFERRED — Logically derived')
+                .addOption(TRUST_LEVELS.UNVERIFIED, '⚠️ UNVERIFIED — No checks')
+                .setValue(this.plugin.settings.trustThreshold)
+                .onChange(async v => {
+                    this.plugin.settings.trustThreshold = v;
+                    await this.plugin.saveSettings();
+                }));
+
+        new Setting(containerEl)
+            .setName('Show Trust Badges')
+            .setDesc('Display trust level badges in result modals and status bar')
+            .addToggle(t => t.setValue(this.plugin.settings.trustDisplay).onChange(async v => {
+                this.plugin.settings.trustDisplay = v;
                 await this.plugin.saveSettings();
             }));
 
@@ -1623,17 +1797,85 @@ class VaultScholarSettingTab extends PluginSettingTab {
                     await this.plugin.saveSettings();
                 }));
 
-        // ===== External Backup =====
-        containerEl.createEl('h3', { text: '💾 External Backup' });
+        // ===== Evidence-Gated Knowledge =====
+        containerEl.createEl('h3', { text: '📜 Evidence-Gated Knowledge' });
 
         new Setting(containerEl)
-            .setName('External backup path')
-            .setDesc('Directory outside the vault for Layer-1 backups (e.g. D:\\Obsidian-Backups\\MyVault)')
-            .addText(t => t
-                .setPlaceholder('D:\\Obsidian-Backups\\MyVault')
-                .setValue(this.plugin.settings.externalBackupPath)
+            .setName('Enable Evidence Gating')
+            .setDesc('Block external factual claims without a source from entering the vault (Section 9)')
+            .addToggle(t => t.setValue(this.plugin.settings.evidenceGating).onChange(async v => {
+                this.plugin.settings.evidenceGating = v;
+                await this.plugin.saveSettings();
+            }));
+
+        // ===== Research Mode =====
+        containerEl.createEl('h3', { text: '🔬 Research Mode' });
+
+        new Setting(containerEl)
+            .setName('Enable Research Mode')
+            .setDesc('Allow the 13-stage research pipeline (Section 10)')
+            .addToggle(t => t.setValue(this.plugin.settings.researchModeEnabled).onChange(async v => {
+                this.plugin.settings.researchModeEnabled = v;
+                await this.plugin.saveSettings();
+            }));
+
+        new Setting(containerEl)
+            .setName('Search Provider')
+            .setDesc('DuckDuckGo (zero-config) or SearXNG (user-specified endpoint — self-hosted OR third-party)')
+            .addDropdown(d => d
+                .addOption('duckduckgo', 'DuckDuckGo (zero-config, no API key)')
+                .addOption('searxng', 'SearXNG (user-specified endpoint)')
+                .setValue(this.plugin.settings.searchProvider)
                 .onChange(async v => {
-                    this.plugin.settings.externalBackupPath = v;
+                    this.plugin.settings.searchProvider = v;
+                    await this.plugin.saveSettings();
+                    this.display();
+                }));
+
+        new Setting(containerEl)
+            .setName('SearXNG URL')
+            .setDesc('Your SearXNG instance endpoint — self-hosted (e.g. http://localhost:8080) OR third-party (e.g. https://searx.be). Must support /search?format=json. User is responsible for the endpoint.')
+            .addText(t => t
+                .setPlaceholder('http://localhost:8080')
+                .setValue(this.plugin.settings.searxngUrl)
+                .setDisabled(this.plugin.settings.searchProvider !== 'searxng')
+                .onChange(async v => {
+                    this.plugin.settings.searxngUrl = v.trim();
+                    await this.plugin.saveSettings();
+                }));
+
+        new Setting(containerEl)
+            .setName('SearXNG Categories')
+            .setDesc('SearXNG search categories (e.g. general, science)')
+            .addText(t => t
+                .setPlaceholder('general')
+                .setValue(this.plugin.settings.searxngCategories)
+                .onChange(async v => {
+                    this.plugin.settings.searxngCategories = v.trim() || 'general';
+                    await this.plugin.saveSettings();
+                }));
+
+        new Setting(containerEl)
+            .setName('Max Sources')
+            .setDesc('Maximum number of sources to retrieve and analyze')
+            .addSlider(s => s
+                .setLimits(1, 20, 1)
+                .setValue(this.plugin.settings.maxSources)
+                .setDynamicTooltip()
+                .onChange(async v => {
+                    this.plugin.settings.maxSources = v;
+                    await this.plugin.saveSettings();
+                }));
+
+        new Setting(containerEl)
+            .setName('Max Search Results')
+            .setDesc('Maximum search results per query')
+            .addSlider(s => s
+                .setLimits(3, 30, 1)
+                .setValue(this.plugin.settings.maxSearchResults)
+                .setDynamicTooltip()
+                .onChange(async v => {
+                    this.plugin.settings.maxSearchResults = v;
                     await this.plugin.saveSettings();
                 }));
 

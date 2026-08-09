@@ -164,6 +164,25 @@ test('history prunes to maxVersions', () => {
     assert.strictEqual(versions[2].version, 5);
 });
 
+test('history restore writes a version back to disk', () => {
+    const dir = makeTempDir('vs-hist-');
+    const cas = new CASStore(path.join(dir, 'blobs'));
+    const history = new HistoryEngine(path.join(dir, 'history'), cas);
+    const note = 'Research/A.md';
+    const target = path.join(dir, 'vault', 'Research', 'A.md');
+    history.record(note, 'alpha content');
+    history.record(note, 'beta content');
+    // Restore version 1 onto disk
+    const restored = history.restore(note, 1, target);
+    assert.strictEqual(restored, 'alpha content');
+    assert.strictEqual(fs.readFileSync(target, 'utf8'), 'alpha content');
+    // Restore version 2
+    history.restore(note, 2, target);
+    assert.strictEqual(fs.readFileSync(target, 'utf8'), 'beta content');
+    // Restore nonexistent version returns null
+    assert.strictEqual(history.restore(note, 999, target), null);
+});
+
 // ===== semantic-diff.js =====
 
 test('parseSemanticResult extracts fields', () => {
