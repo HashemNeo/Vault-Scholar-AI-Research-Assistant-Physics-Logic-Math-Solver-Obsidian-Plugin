@@ -1,0 +1,19 @@
+{
+  "compilerOptions": {
+    "inlineSourceMap": true,
+    "inlineSources": true,
+    "module": "ESNext",
+    "target": "ES2018",
+    "allowJs": true,
+    "noImplicitAny": true,
+    "moduleResolution": "bundler",
+    "importHelpers": true,
+    "isolatedModules": true,
+    "strictNullChecks": true,
+    "esModuleInterop": true,
+    "types": ["node"],
+    "lib": ["DOM", "ES6"],
+    "skipLibCheck": true
+  },
+  "include": ["src/**/*", "tests/**/*"]
+}

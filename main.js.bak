@@ -1,0 +1,2956 @@
+"use strict";
+var __getOwnPropNames = Object.getOwnPropertyNames;
+var __commonJS = (cb, mod) => function __require() {
+  return mod || (0, cb[__getOwnPropNames(cb)[0]])((mod = { exports: {} }).exports, mod), mod.exports;
+};
+
+// src/lib/cas.ts
+var require_cas = __commonJS({
+  "src/lib/cas.ts"(exports2, module2) {
+    "use strict";
+    var fs2 = require("fs");
+    var path2 = require("path");
+    var crypto2 = require("crypto");
+    function sha256(data) {
+      return crypto2.createHash("sha256").update(data).digest("hex");
+    }
+    var CASStore = class {
+      /**
+       * @param {string} blobsDir - Directory where blob files are stored.
+       */
+      constructor(blobsDir) {
+        this.blobsDir = blobsDir;
+      }
+      init() {
+        if (!fs2.existsSync(this.blobsDir)) {
+          fs2.mkdirSync(this.blobsDir, { recursive: true });
+        }
+      }
+      /**
+       * Store content (Buffer or string). Returns the SHA-256 hash.
+       * If content already exists, it is not duplicated.
+       */
+      put(content) {
+        this.init();
+        const buf = Buffer.isBuffer(content) ? content : Buffer.from(content, "utf8");
+        const hash = sha256(buf);
+        const dest = path2.join(this.blobsDir, hash);
+        if (!fs2.existsSync(dest)) {
+          const tmp = dest + ".tmp";
+          fs2.writeFileSync(tmp, buf);
+          fs2.renameSync(tmp, dest);
+        }
+        return hash;
+      }
+      /**
+       * Store from a file path. Returns the SHA-256 hash.
+       */
+      putFile(filePath) {
+        const buf = fs2.readFileSync(filePath);
+        return this.put(buf);
+      }
+      /**
+       * Retrieve content by hash. Returns Buffer, or null if missing.
+       */
+      get(hash) {
+        const dest = path2.join(this.blobsDir, hash);
+        if (!fs2.existsSync(dest)) return null;
+        return fs2.readFileSync(dest);
+      }
+      /**
+       * Retrieve content as UTF-8 string. Returns null if missing.
+       */
+      getText(hash) {
+        const buf = this.get(hash);
+        return buf ? buf.toString("utf8") : null;
+      }
+      /**
+       * Check whether a hash exists.
+       */
+      has(hash) {
+        return fs2.existsSync(path2.join(this.blobsDir, hash));
+      }
+      /**
+       * Delete a blob by hash. Returns true if removed.
+       */
+      remove(hash) {
+        const dest = path2.join(this.blobsDir, hash);
+        if (fs2.existsSync(dest)) {
+          fs2.unlinkSync(dest);
+          return true;
+        }
+        return false;
+      }
+      /**
+       * List all blob hashes currently stored.
+       */
+      list() {
+        this.init();
+        return fs2.readdirSync(this.blobsDir).filter((f) => /^[0-9a-f]{64}$/.test(f));
+      }
+      /**
+       * Garbage collection: keep only blobs referenced by the given
+       * set of hashes. Returns count of removed blobs.
+       */
+      gc(keepHashes) {
+        const keep = new Set(keepHashes);
+        let removed = 0;
+        for (const hash of this.list()) {
+          if (!keep.has(hash)) {
+            this.remove(hash);
+            removed++;
+          }
+        }
+        return removed;
+      }
+    };
+    module2.exports = { CASStore, sha256 };
+  }
+});
+
+// src/lib/trust.ts
+var require_trust = __commonJS({
+  "src/lib/trust.ts"(exports2, module2) {
+    "use strict";
+    var TRUST_LEVELS2 = {
+      TRUSTED: "TRUSTED",
+      // User-verified, highest confidence
+      VERIFIED: "VERIFIED",
+      // Cross-checked against authoritative sources
+      INFERRED: "INFERRED",
+      // Derived logically but not directly verified
+      UNVERIFIED: "UNVERIFIED"
+      // No verification performed
+    };
+    var TRUST_ORDER = {
+      [TRUST_LEVELS2.TRUSTED]: 4,
+      [TRUST_LEVELS2.VERIFIED]: 3,
+      [TRUST_LEVELS2.INFERRED]: 2,
+      [TRUST_LEVELS2.UNVERIFIED]: 1
+    };
+    var CONTENT_SOURCES2 = {
+      USER_CREATED: "USER-CREATED",
+      // Written directly by the human user
+      AI_GENERATED: "AI-GENERATED",
+      // Produced by an LLM
+      EXTERNAL_SOURCED: "EXTERNAL-SOURCED",
+      // Imported from outside the vault
+      MATH_DERIVED: "MATH-DERIVED",
+      // Result of a mathematical/physical derivation
+      SIMULATION_OUTPUT: "SIMULATION-OUTPUT",
+      // Output of a sandboxed simulation
+      CODE_GENERATED: "CODE-GENERATED"
+      // Output of the Coder Agent / AI codegen
+    };
+    var DEFAULT_SOURCE = CONTENT_SOURCES2.AI_GENERATED;
+    var DEFAULT_LEVEL = TRUST_LEVELS2.UNVERIFIED;
+    var TrustClassifier2 = class {
+      /**
+       * Classify content with a trust level and content source.
+       *
+       * @param {string} content - The content to classify.
+       * @param {Object} opts
+       *   - source: content source (CONTENT_SOURCES.*). Default AI_GENERATED.
+       *   - trustLevel: explicit trust level. If omitted, inferred.
+       *   - verifiedBy: e.g. 'user', 'cas', 'sandbox', 'citation'.
+       *   - confidence: 0-100 numeric confidence.
+       *   - citations: optional array of citation strings.
+       *   - model: optional model id that generated the content.
+       *   - metadata: optional extra metadata.
+       * @returns {Object} trust record.
+       */
+      static classify(content, opts = {}) {
+        var _a;
+        const text = String(content || "");
+        const source = opts.source || DEFAULT_SOURCE;
+        const trustLevel = opts.trustLevel || inferTrustLevel(text, source, opts);
+        const confidence = clampConfidence((_a = opts.confidence) != null ? _a : inferConfidence(trustLevel, source));
+        const now = (/* @__PURE__ */ new Date()).toISOString();
+        return {
+          trustLevel,
+          contentSource: source,
+          verified: trustLevel === TRUST_LEVELS2.TRUSTED || trustLevel === TRUST_LEVELS2.VERIFIED,
+          verifiedBy: opts.verifiedBy || (trustLevel === TRUST_LEVELS2.TRUSTED ? "user" : trustLevel === TRUST_LEVELS2.VERIFIED ? "citation" : null),
+          confidence,
+          citations: opts.citations || [],
+          model: opts.model || null,
+          classifiedAt: now,
+          hash: require_cas().sha256(text),
+          metadata: opts.metadata || {}
+        };
+      }
+      /**
+       * Combine several trust records for the same content into one.
+       * The resulting trust level is the highest among records whose
+       * source is considered authoritative (user, citation, sandbox),
+       * otherwise the lowest (conservative).
+       *
+       * @param {Array<Object>} records
+       * @returns {Object} merged record, or null if no records.
+       */
+      static merge(records) {
+        const valid = (records || []).filter(Boolean);
+        if (valid.length === 0) return null;
+        const authoritative = valid.filter(
+          (r) => isAuthoritativeSource(r.contentSource)
+        );
+        const pool = authoritative.length > 0 ? authoritative : valid;
+        const best = pool.reduce((a, b) => {
+          return TRUST_ORDER[b.trustLevel] > TRUST_ORDER[a.trustLevel] ? b : a;
+        }, pool[0]);
+        return {
+          trustLevel: best.trustLevel,
+          contentSource: best.contentSource,
+          verified: best.verified,
+          verifiedBy: best.verifiedBy,
+          confidence: Math.round(pool.reduce((s, r) => s + (r.confidence || 0), 0) / pool.length),
+          citations: [...new Set(valid.flatMap((r) => r.citations || []))],
+          model: valid.map((r) => r.model).filter(Boolean).join(","),
+          classifiedAt: (/* @__PURE__ */ new Date()).toISOString(),
+          hash: best.hash,
+          metadata: Object.assign({}, ...valid.map((r) => r.metadata || {}))
+        };
+      }
+      /**
+       * Check whether a trust record meets a minimum threshold.
+       *
+       * @param {Object} record
+       * @param {string} minLevel - Minimum trust level required.
+       * @returns {boolean}
+       */
+      static meetsThreshold(record, minLevel = TRUST_LEVELS2.VERIFIED) {
+        if (!record) return false;
+        return TRUST_ORDER[record.trustLevel] >= TRUST_ORDER[minLevel];
+      }
+    };
+    var DEFAULT_POLICIES = {
+      "vault.write": TRUST_LEVELS2.VERIFIED,
+      // Writing to the vault requires verification
+      "vault.write.user": TRUST_LEVELS2.TRUSTED,
+      // Overwriting user-created content requires explicit trust
+      "script.execute": TRUST_LEVELS2.VERIFIED,
+      // Executing scripts requires verification
+      "research.cite": TRUST_LEVELS2.VERIFIED,
+      // Citations must be verified
+      "simulation.run": TRUST_LEVELS2.INFERRED,
+      // Simulations may run on inferred models
+      "code.deploy": TRUST_LEVELS2.VERIFIED,
+      // Deploying generated code requires verification
+      "vault.restore": TRUST_LEVELS2.TRUSTED,
+      // Restoring snapshots requires user trust
+      "ai.auto.apply": TRUST_LEVELS2.VERIFIED
+      // Auto-applying AI edits requires verification
+    };
+    var TrustBoundary2 = class {
+      /**
+       * @param {Object} opts - { policies, onDecision } 
+       *   onDecision(decision) is called for every enforcement decision
+       *   (useful for audit logging / UI display).
+       */
+      constructor(opts = {}) {
+        this.policies = { ...DEFAULT_POLICIES, ...opts.policies || {} };
+        this.onDecision = opts.onDecision || null;
+        this.decisions = [];
+        this.enabled = opts.enabled !== false;
+      }
+      /**
+       * Evaluate whether an operation may proceed given the content's
+       * trust record and the operation policy.
+       *
+       * @param {string} operation - Policy key, e.g. 'vault.write'.
+       * @param {Object} record - Trust record from TrustClassifier.
+       * @param {Object} opts - { content, source, message, userOverride }
+       * @returns {{allowed: boolean, level: string, required: string, reason: string, canOverride: boolean}}
+       */
+      enforce(operation, record, opts = {}) {
+        const required = this.policies[operation];
+        if (!required) {
+          return this._decide(operation, record, {
+            allowed: false,
+            reason: `No policy defined for operation "${operation}"`,
+            canOverride: true
+          }, opts);
+        }
+        if (!this.enabled) {
+          return this._decide(operation, record, {
+            allowed: true,
+            reason: "Trust boundary disabled",
+            canOverride: false
+          }, opts);
+        }
+        const level = record ? record.trustLevel : DEFAULT_LEVEL;
+        const passed = TRUST_ORDER[level] >= TRUST_ORDER[required];
+        const canOverride = record ? isAuthoritativeSource(record.contentSource) || record.trustLevel === TRUST_LEVELS2.TRUSTED : false;
+        if (passed) {
+          return this._decide(operation, record, {
+            allowed: true,
+            reason: `${level} meets required ${required}`,
+            canOverride: false
+          }, opts);
+        }
+        return this._decide(operation, record, {
+          allowed: false,
+          reason: `Trust level ${level} is below required ${required} for "${operation}"`,
+          canOverride
+        }, opts);
+      }
+      _decide(operation, record, decision, opts) {
+        decision.operation = operation;
+        decision.contentSource = record ? record.contentSource : DEFAULT_SOURCE;
+        decision.level = record ? record.trustLevel : DEFAULT_LEVEL;
+        decision.required = this.policies[operation] || null;
+        decision.timestamp = (/* @__PURE__ */ new Date()).toISOString();
+        decision.bypass = !!opts.userOverride;
+        if (opts.userOverride && decision.canOverride) {
+          decision.allowed = true;
+          decision.reason = `Overridden by user (original: ${decision.reason})`;
+        }
+        this.decisions.push(decision);
+        if (this.onDecision) {
+          try {
+            this.onDecision(decision);
+          } catch (e) {
+          }
+        }
+        return decision;
+      }
+      /**
+       * Export the audit trail of all enforcement decisions.
+       */
+      auditTrail() {
+        return this.decisions.slice();
+      }
+      /**
+       * Clear the in-memory audit trail.
+       */
+      clear() {
+        this.decisions = [];
+      }
+    };
+    function inferTrustLevel(text, source, opts) {
+      if (opts.trustLevel) {
+        if (TRUST_ORDER[opts.trustLevel]) return opts.trustLevel;
+      }
+      if (source === CONTENT_SOURCES2.USER_CREATED) return TRUST_LEVELS2.TRUSTED;
+      if (source === CONTENT_SOURCES2.MATH_DERIVED || source === CONTENT_SOURCES2.SIMULATION_OUTPUT) {
+        return opts.verificationMethod ? TRUST_LEVELS2.VERIFIED : TRUST_LEVELS2.INFERRED;
+      }
+      if (opts.citations && opts.citations.length > 0 || opts.verifiedBy) {
+        return TRUST_LEVELS2.VERIFIED;
+      }
+      return DEFAULT_LEVEL;
+    }
+    function inferConfidence(level, source) {
+      switch (level) {
+        case TRUST_LEVELS2.TRUSTED:
+          return 95;
+        case TRUST_LEVELS2.VERIFIED:
+          return 80;
+        case TRUST_LEVELS2.INFERRED:
+          return 60;
+        default:
+          return 30;
+      }
+    }
+    function clampConfidence(n) {
+      n = Number(n);
+      if (!isFinite(n)) n = 0;
+      return Math.max(0, Math.min(100, Math.round(n)));
+    }
+    function isAuthoritativeSource(source) {
+      return source === CONTENT_SOURCES2.USER_CREATED || source === CONTENT_SOURCES2.MATH_DERIVED || source === CONTENT_SOURCES2.SIMULATION_OUTPUT;
+    }
+    module2.exports = {
+      TRUST_LEVELS: TRUST_LEVELS2,
+      CONTENT_SOURCES: CONTENT_SOURCES2,
+      TRUST_ORDER,
+      DEFAULT_POLICIES,
+      TrustClassifier: TrustClassifier2,
+      TrustBoundary: TrustBoundary2
+    };
+  }
+});
+
+// src/lib/evidence.ts
+var require_evidence = __commonJS({
+  "src/lib/evidence.ts"(exports2, module2) {
+    "use strict";
+    var { TrustClassifier: TrustClassifier2, TRUST_LEVELS: TRUST_LEVELS2, CONTENT_SOURCES: CONTENT_SOURCES2 } = require_trust();
+    var { sha256 } = require_cas();
+    var EVIDENCE_MARKERS2 = {
+      SOURCE: "[SOURCE:",
+      INFERENCE: "[INFERENCE]",
+      VAULT_CLAIM: "[VAULT-CLAIM]",
+      USER_CLAIM: "[USER-CLAIM]",
+      EXTERNAL_VERIFIED: "[EXTERNAL-VERIFIED]",
+      SIMULATION_RESULT: "[SIMULATION RESULT]",
+      ASSUMPTION: "[ASSUMPTION:",
+      DOMAIN: "[DOMAIN:",
+      CONTRADICTION: "[CONTRADICTION:",
+      UNVERIFIED: "[UNVERIFIED]",
+      VERIFIED: "[VERIFIED]"
+    };
+    var CLAIM_ORIGIN2 = {
+      USER_CLAIM: "USER-CLAIM",
+      // User-created; user is the source
+      VAULT_CLAIM: "VAULT-CLAIM",
+      // Claim stored in vault (may be user or prior AI)
+      EXTERNAL_VERIFIED: "EXTERNAL-VERIFIED",
+      // Backed by an external source that was retrieved/validated
+      INFERENCE: "INFERENCE",
+      // AI logical inference, not directly verified
+      MATH_DERIVATION: "MATH-DERIVATION",
+      // Math/physics derivation with assumptions + domain
+      SIMULATION_RESULT: "SIMULATION-RESULT"
+      // Output of a sandboxed simulation — NOT physical truth
+    };
+    function normalizeUrl(url) {
+      if (!url) return null;
+      let u = String(url).trim();
+      if (!u) return null;
+      if (!/^https?:\/\//i.test(u)) u = "https://" + u;
+      try {
+        return new URL(u).href;
+      } catch (e) {
+        return null;
+      }
+    }
+    function isUrlLike(text) {
+      return /^https?:\/\/\S+$/i.test(String(text || "").trim());
+    }
+    var AMP = String.fromCharCode(38);
+    function decodeEntities(str) {
+      return String(str || "").replace(new RegExp(AMP + "amp;", "g"), AMP).replace(new RegExp(AMP + "lt;", "g"), "<").replace(new RegExp(AMP + "gt;", "g"), ">").replace(new RegExp(AMP + "quot;", "g"), '"').replace(/&#39;/g, "'").replace(new RegExp(AMP + "nbsp;", "g"), " ");
+    }
+    function stripHtml(html) {
+      return String(html || "").replace(/<script[\s\S]*?<\/script>/gi, " ").replace(/<style[\s\S]*?<\/style>/gi, " ").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+    }
+    function truncate2(str, max) {
+      return String(str || "").length > max ? String(str || "").slice(0, max) + "\u2026" : String(str || "");
+    }
+    function normalizeSources(sources) {
+      if (!sources) return [];
+      const list = Array.isArray(sources) ? sources : [sources];
+      const out = [];
+      for (const s of list) {
+        const str = String(s || "").trim();
+        if (!str) continue;
+        if (isUrlLike(str)) {
+          const norm = normalizeUrl(str);
+          if (norm && !out.includes(norm)) out.push(norm);
+        } else {
+          if (!out.includes(str)) out.push(str);
+        }
+      }
+      return out;
+    }
+    function inferContentSource(chunk) {
+      const t = String(chunk || "");
+      if (/(\[USER-CLAIM\])/.test(t)) return CONTENT_SOURCES2.USER_CREATED;
+      if (/(\[SIMULATION RESULT\])/.test(t)) return CONTENT_SOURCES2.SIMULATION_OUTPUT;
+      if (/\[ASSUMPTION:/.test(t) && /\[DOMAIN:/.test(t)) return CONTENT_SOURCES2.MATH_DERIVED;
+      if (/\[SOURCE:\s*https?:\/\//i.test(t)) return CONTENT_SOURCES2.EXTERNAL_SOURCED;
+      if (/(\[VAULT-CLAIM\])/.test(t)) return CONTENT_SOURCES2.USER_CREATED;
+      if (/(\[INFERENCE\])/.test(t)) return CONTENT_SOURCES2.AI_GENERATED;
+      return CONTENT_SOURCES2.AI_GENERATED;
+    }
+    function inferOrigin(text, contentSource, sources, opts) {
+      if (opts && opts.origin) return opts.origin;
+      const t = String(text || "");
+      if (/(\[USER-CLAIM\])/.test(t) || contentSource === CONTENT_SOURCES2.USER_CREATED) {
+        return CLAIM_ORIGIN2.USER_CLAIM;
+      }
+      if (/(\[SIMULATION RESULT\])/.test(t) || contentSource === CONTENT_SOURCES2.SIMULATION_OUTPUT) {
+        return CLAIM_ORIGIN2.SIMULATION_RESULT;
+      }
+      if (/\[ASSUMPTION:/.test(t) && /\[DOMAIN:/.test(t) || contentSource === CONTENT_SOURCES2.MATH_DERIVED) {
+        return CLAIM_ORIGIN2.MATH_DERIVATION;
+      }
+      if (/(\[VAULT-CLAIM\])/.test(t)) {
+        return CLAIM_ORIGIN2.VAULT_CLAIM;
+      }
+      if (sources.length > 0 || /\[SOURCE:/.test(t)) {
+        return CLAIM_ORIGIN2.EXTERNAL_VERIFIED;
+      }
+      if (/(\[INFERENCE\])/.test(t) || contentSource === CONTENT_SOURCES2.AI_GENERATED) {
+        return CLAIM_ORIGIN2.INFERENCE;
+      }
+      return CLAIM_ORIGIN2.INFERENCE;
+    }
+    function finalizeDecision(allowed, ctx) {
+      const record = TrustClassifier2.classify(ctx.text, {
+        source: ctx.contentSource,
+        trustLevel: ctx.trustLevel,
+        verified: allowed && (ctx.trustLevel === TRUST_LEVELS2.TRUSTED || ctx.trustLevel === TRUST_LEVELS2.VERIFIED),
+        verifiedBy: allowed ? ctx.trustLevel === TRUST_LEVELS2.TRUSTED ? "user" : ctx.trustLevel === TRUST_LEVELS2.VERIFIED ? "evidence" : null : null,
+        citations: ctx.sources || [],
+        metadata: Object.assign(
+          { origin: ctx.origin },
+          ctx.opts && ctx.opts.metadata || {},
+          ctx.extra || {}
+        )
+      });
+      return {
+        allowed,
+        origin: ctx.origin,
+        trustLevel: ctx.trustLevel,
+        reason: ctx.reason,
+        markers: ctx.markers,
+        sources: ctx.sources || [],
+        record,
+        extra: ctx.extra || null
+      };
+    }
+    var EvidenceGate2 = class _EvidenceGate {
+      /**
+       * Build the canonical simulation header.
+       *
+       *   Model + Assumptions + Equations + Numerical Method + Output
+       *
+       * @param {string} model - Physical/mathematical model description.
+       * @param {Array|string} assumptions - List of assumptions.
+       * @param {string} equations - Equations used.
+       * @param {string} numericalMethod - e.g. 'Euler (forward, dt=0.001)'
+       * @returns {string} markdown block.
+       */
+      static simulationHeader(model, assumptions, equations, numericalMethod) {
+        const assumptionList = Array.isArray(assumptions) ? assumptions : [assumptions];
+        const lines = [];
+        lines.push("> [SIMULATION RESULT] \u2014 Simulation output is NOT absolute physical truth");
+        lines.push(">");
+        lines.push("> **Model:** " + (model || "Unspecified"));
+        lines.push(">");
+        lines.push("> **Assumptions:**");
+        if (assumptionList.length > 0) {
+          for (const a of assumptionList) {
+            if (a) lines.push("> - " + String(a).trim());
+          }
+        } else {
+          lines.push("> - (none stated)");
+        }
+        lines.push(">");
+        lines.push("> **Equations:**");
+        if (equations) {
+          lines.push(">");
+          lines.push("> ```text");
+          lines.push("> " + String(equations).trim().replace(/\n/g, "\n> "));
+          lines.push("> ```");
+        } else {
+          lines.push("> - (none stated)");
+        }
+        lines.push(">");
+        lines.push("> **Numerical Method:** " + (numericalMethod || "Unspecified"));
+        lines.push(">");
+        lines.push("> *Model + Assumptions + Equations + Numerical Method + Output \u2014 a simulation is not proof.*");
+        return lines.join("\n");
+      }
+      /**
+       * Gate a claim against the six evidence rules.
+       *
+       * @param {string} claim - The claim text.
+       * @param {Object} opts
+       *   - contentSource: CONTENT_SOURCES.* (default AI_GENERATED)
+       *   - origin: one of CLAIM_ORIGIN.* (auto-inferred if omitted)
+       *   - sources: array of source URLs / citation strings
+       *   - assumptions: array (math derivations)
+       *   - domainOfValidity: string (math derivations)
+       *   - equations / numericalMethod / model: for sim results
+       *   - userOverride: boolean (bypass gate)
+       *   - verified: boolean (whether sources were validated)
+       *   - metadata: extra metadata
+       * @returns {{allowed, origin, trustLevel, reason, markers, sources, record, extra}}
+       */
+      static gate(claim, opts = {}) {
+        const text = String(claim || "").trim();
+        const sources = normalizeSources(opts.sources || opts.citations || []);
+        const contentSource = opts.contentSource || CONTENT_SOURCES2.AI_GENERATED;
+        const origin = opts.origin || inferOrigin(text, contentSource, sources, opts);
+        const markers = [];
+        const problems = [];
+        if ((contentSource === CONTENT_SOURCES2.EXTERNAL_SOURCED || origin === CLAIM_ORIGIN2.EXTERNAL_VERIFIED) && sources.length === 0 && !opts.userOverride) {
+          problems.push("External factual claim without a source is BLOCKED (Evidence-Gated Knowledge rule 1)");
+          return {
+            allowed: false,
+            origin,
+            trustLevel: TRUST_LEVELS2.UNVERIFIED,
+            reason: problems.join("; "),
+            markers: ["[UNVERIFIED]"],
+            sources: [],
+            extra: null,
+            record: TrustClassifier2.classify(text, {
+              source: contentSource,
+              trustLevel: TRUST_LEVELS2.UNVERIFIED,
+              metadata: { origin, evidenceProblems: problems }
+            })
+          };
+        }
+        if (contentSource === CONTENT_SOURCES2.USER_CREATED || origin === CLAIM_ORIGIN2.USER_CLAIM) {
+          markers.push(EVIDENCE_MARKERS2.USER_CLAIM);
+          return finalizeDecision(true, {
+            origin: CLAIM_ORIGIN2.USER_CLAIM,
+            trustLevel: TRUST_LEVELS2.TRUSTED,
+            reason: "User-created claim \u2014 user is the source",
+            markers,
+            sources,
+            contentSource,
+            text,
+            opts
+          });
+        }
+        if (contentSource === CONTENT_SOURCES2.AI_GENERATED && sources.length === 0 && !opts.assumptions) {
+          markers.push(EVIDENCE_MARKERS2.INFERENCE);
+          return finalizeDecision(true, {
+            origin: CLAIM_ORIGIN2.INFERENCE,
+            trustLevel: TRUST_LEVELS2.INFERRED,
+            reason: "AI inference \u2014 marked INFERENCE",
+            markers,
+            sources,
+            contentSource,
+            text,
+            opts
+          });
+        }
+        if (origin === CLAIM_ORIGIN2.VAULT_CLAIM) {
+          markers.push(EVIDENCE_MARKERS2.VAULT_CLAIM);
+          return finalizeDecision(true, {
+            origin: CLAIM_ORIGIN2.VAULT_CLAIM,
+            trustLevel: TRUST_LEVELS2.VERIFIED,
+            reason: "Vault claim \u2014 distinguished from externally verified (no external validation performed)",
+            markers,
+            sources: [],
+            contentSource,
+            text,
+            opts
+          });
+        }
+        if (contentSource === CONTENT_SOURCES2.MATH_DERIVED || origin === CLAIM_ORIGIN2.MATH_DERIVATION) {
+          const assumptions = Array.isArray(opts.assumptions) ? opts.assumptions : [];
+          const domain = String(opts.domainOfValidity || "").trim();
+          if (assumptions.length === 0 || !domain) {
+            problems.push("Math derivation missing assumptions and/or domain of validity \u2014 cannot be trusted");
+          } else {
+            markers.push("[ASSUMPTION: " + assumptions.join("; ") + "]");
+            markers.push("[DOMAIN: " + domain + "]");
+          }
+          const complete = problems.length === 0;
+          return finalizeDecision(complete, {
+            origin: CLAIM_ORIGIN2.MATH_DERIVATION,
+            trustLevel: complete ? TRUST_LEVELS2.VERIFIED : TRUST_LEVELS2.UNVERIFIED,
+            reason: complete ? "Math derivation with assumptions and domain of validity" : problems.join("; "),
+            markers,
+            sources,
+            contentSource,
+            text,
+            opts,
+            extra: { assumptions, domainOfValidity: domain }
+          });
+        }
+        if (contentSource === CONTENT_SOURCES2.SIMULATION_OUTPUT || origin === CLAIM_ORIGIN2.SIMULATION_RESULT) {
+          const header = _EvidenceGate.simulationHeader(
+            opts.model,
+            opts.assumptions,
+            opts.equations,
+            opts.numericalMethod
+          );
+          markers.push(EVIDENCE_MARKERS2.SIMULATION_RESULT);
+          return finalizeDecision(true, {
+            origin: CLAIM_ORIGIN2.SIMULATION_RESULT,
+            trustLevel: TRUST_LEVELS2.INFERRED,
+            reason: "Simulation output \u2014 marked SIMULATION RESULT, not absolute physical truth",
+            markers,
+            sources,
+            contentSource,
+            text,
+            opts,
+            extra: { simulationHeader: header }
+          });
+        }
+        if (sources.length > 0) {
+          markers.push("[SOURCE: " + sources.join(", ") + "]");
+          if (opts.verified) {
+            markers.push(EVIDENCE_MARKERS2.EXTERNAL_VERIFIED);
+          }
+          return finalizeDecision(true, {
+            origin: CLAIM_ORIGIN2.EXTERNAL_VERIFIED,
+            trustLevel: opts.verified === false ? TRUST_LEVELS2.UNVERIFIED : TRUST_LEVELS2.VERIFIED,
+            reason: opts.verified === false ? "Claim has sources but not validated" : "Externally verified claim with sources",
+            markers,
+            sources,
+            contentSource,
+            text,
+            opts
+          });
+        }
+        return finalizeDecision(true, {
+          origin: CLAIM_ORIGIN2.INFERENCE,
+          trustLevel: TRUST_LEVELS2.INFERRED,
+          reason: "AI-generated content \u2014 marked INFERENCE",
+          markers: [EVIDENCE_MARKERS2.INFERENCE],
+          sources,
+          contentSource,
+          text,
+          opts
+        });
+      }
+      /**
+       * Parse evidence markers from markdown content.
+       *
+       * @param {string} content - Note or document text.
+       * @returns {{markers: Object[], claims: Object[]}}
+       */
+      static parseEvidence(content) {
+        const text = String(content || "");
+        const markers = [];
+        const claimBlocks = _EvidenceGate.extractClaims(text);
+        const markerPatterns = [
+          { type: "source", regex: /\[SOURCE:\s*([^\]]+)\]/gi },
+          { type: "assumption", regex: /\[ASSUMPTION:\s*([^\]]+)\]/gi },
+          { type: "domain", regex: /\[DOMAIN:\s*([^\]]+)\]/gi },
+          { type: "contradiction", regex: /\[CONTRADICTION:\s*([^\]]+)\]/gi },
+          { type: "inference", regex: /\[INFERENCE\]/gi },
+          { type: "vault_claim", regex: /\[VAULT-CLAIM\]/gi },
+          { type: "user_claim", regex: /\[USER-CLAIM\]/gi },
+          { type: "external_verified", regex: /\[EXTERNAL-VERIFIED\]/gi },
+          { type: "simulation_result", regex: /\[SIMULATION RESULT\]/gi },
+          { type: "unverified", regex: /\[UNVERIFIED\]/gi },
+          { type: "verified", regex: /\[VERIFIED\]/gi }
+        ];
+        for (const { type, regex } of markerPatterns) {
+          let m;
+          regex.lastIndex = 0;
+          while ((m = regex.exec(text)) !== null) {
+            markers.push({
+              type,
+              value: m[1] ? decodeEntities(m[1].trim()) : null,
+              index: m.index,
+              raw: m[0]
+            });
+          }
+        }
+        const claims = claimBlocks.map(
+          (block) => _EvidenceGate.gate(block.text, { contentSource: block.contentSource })
+        );
+        return { markers, claims };
+      }
+      /**
+       * Validate a full note against evidence rules.
+       *
+       * @param {string} noteContent - Full markdown note.
+       * @returns {{valid: boolean, totalClaims: number, blocked: number,
+       *            allowed: number, issues: Array, summary: Object}}
+       */
+      static validateNote(noteContent) {
+        const text = String(noteContent || "");
+        const claimBlocks = _EvidenceGate.extractClaims(text);
+        const issues = [];
+        const summary = { allowed: 0, blocked: 0, origins: {}, trust: {} };
+        for (const block of claimBlocks) {
+          const result = _EvidenceGate.gate(block.text, {
+            contentSource: block.contentSource
+          });
+          summary.origins[result.origin] = (summary.origins[result.origin] || 0) + 1;
+          summary.trust[result.trustLevel] = (summary.trust[result.trustLevel] || 0) + 1;
+          if (result.allowed) {
+            summary.allowed++;
+          } else {
+            summary.blocked++;
+            issues.push({
+              index: block.index,
+              text: truncate2(block.text, 200),
+              reason: result.reason
+            });
+          }
+        }
+        return {
+          valid: summary.blocked === 0,
+          totalClaims: claimBlocks.length,
+          blocked: summary.blocked,
+          allowed: summary.allowed,
+          issues,
+          summary
+        };
+      }
+      /**
+       * Extract claim-like blocks from markdown content.
+       * Heuristic: splits into sentences, groups into short paragraph
+       * chunks, and tags each with a contentSource based on context
+       * lines (e.g. a following `[SOURCE: ...]`, `[INFERENCE]`, etc.).
+       *
+       * @param {string} content
+       * @returns {Array<{index, text, contentSource, origin, length}>}
+       */
+      static extractClaims(content) {
+        const text = String(content || "");
+        if (!text.trim()) return [];
+        const cleaned = text.replace(/```[\s\S]*?```/g, " ").replace(/^---[\s\S]*?---$/m, " ").replace(/#{1,6}\s.*$/gm, " ").replace(/^\s*>\s?/gm, " ").replace(/!\[[^\]]*\]\([^)]*\)/g, " ");
+        const sentences = cleaned.split(/(?<=[.!?])\s+|\n+/).map((s) => s.trim()).filter((s) => s.length > 20 && s.length < 500);
+        const chunks = [];
+        for (let i = 0; i < sentences.length; i += 3) {
+          const chunk = sentences.slice(i, i + 3).join(" ");
+          if (chunk.length < 20) continue;
+          const index = text.indexOf(sentences[i]);
+          chunks.push({
+            index: index >= 0 ? index : 0,
+            text: chunk,
+            contentSource: inferContentSource(chunk),
+            origin: inferOrigin(chunk, inferContentSource(chunk), [], {}),
+            length: chunk.length
+          });
+        }
+        return chunks;
+      }
+      /**
+       * Format a gated claim into markdown with its evidence markers.
+       *
+       * @param {string} claimText
+       * @param {Object} result - Result from EvidenceGate.gate
+       * @returns {string}
+       */
+      static formatClaim(claimText, result) {
+        const lines = [];
+        lines.push("- " + String(claimText || "").trim());
+        const meta = (result && result.markers ? result.markers : []).filter(Boolean);
+        if (result && result.sources && result.sources.length > 0) {
+          meta.push("[SOURCE: " + result.sources.join(", ") + "]");
+        }
+        if (result && result.extra && result.extra.assumptions && result.extra.assumptions.length > 0) {
+          meta.push("[ASSUMPTION: " + result.extra.assumptions.join("; ") + "]");
+        }
+        if (result && result.extra && result.extra.domainOfValidity) {
+          meta.push("[DOMAIN: " + result.extra.domainOfValidity + "]");
+        }
+        if (meta.length > 0) {
+          lines.push("   " + meta.join(" "));
+        }
+        return lines.join("\n");
+      }
+    };
+    module2.exports = {
+      EVIDENCE_MARKERS: EVIDENCE_MARKERS2,
+      CLAIM_ORIGIN: CLAIM_ORIGIN2,
+      EvidenceGate: EvidenceGate2,
+      normalizeSources,
+      normalizeUrl,
+      isUrlLike,
+      stripHtml,
+      decodeEntities,
+      sha256
+    };
+  }
+});
+
+// src/lib/research.ts
+var require_research = __commonJS({
+  "src/lib/research.ts"(exports2, module2) {
+    "use strict";
+    var { EvidenceGate: EvidenceGate2, CLAIM_ORIGIN: CLAIM_ORIGIN2, normalizeUrl, isUrlLike, stripHtml, decodeEntities } = require_evidence();
+    var { TrustClassifier: TrustClassifier2, TRUST_LEVELS: TRUST_LEVELS2, CONTENT_SOURCES: CONTENT_SOURCES2 } = require_trust();
+    var { sha256 } = require_cas();
+    var SOURCE_TRUST2 = {
+      HIGH: "HIGH",
+      MEDIUM: "MEDIUM",
+      LOW: "LOW"
+    };
+    var HIGH_DOMAIN_RE = /(^|\.)(arxiv\.org|gov|edu|ac\.|scholar\.google\.com|doi\.org|nature\.com|sciencemag\.org|cell\.com|nejm\.org|pubmed\.ncbi\.nlm\.nih\.gov|phys\.org)$/i;
+    var MEDIUM_DOMAIN_RE = /(^|\.)(wikipedia\.org|bbc\.com|cnn\.com|reuters\.com|apnews\.com|nytimes\.com|theguardian\.com|economist\.com|npr\.org|pbs\.org|medium\.com|github\.io|stackexchange\.com|stackoverflow\.com)$/i;
+    var LOW_DOMAIN_RE = /(^|\.)(blogspot\.com|wordpress\.com|tumblr\.com|reddit\.com|quora\.com|twitter\.com|x\.com|facebook\.com|instagram\.com|tiktok\.com)$/i;
+    var SourceClassifier2 = class _SourceClassifier {
+      /**
+       * Classify a source URL's trust level (heuristic, local).
+       *
+       * @param {string} url
+       * @returns {{trust: string, domain: string|null, reason: string}}
+       */
+      static classify(url) {
+        const u = normalizeUrl(url);
+        if (!u) {
+          return { trust: SOURCE_TRUST2.LOW, domain: null, reason: "Invalid or missing URL" };
+        }
+        let host;
+        try {
+          host = new URL(u).hostname;
+        } catch (e) {
+          return { trust: SOURCE_TRUST2.LOW, domain: null, reason: "Invalid URL" };
+        }
+        host = host.toLowerCase().replace(/^www\./, "");
+        if (HIGH_DOMAIN_RE.test(host)) {
+          return { trust: SOURCE_TRUST2.HIGH, domain: host, reason: "High-authority domain (arxiv/gov/edu/academic)" };
+        }
+        if (MEDIUM_DOMAIN_RE.test(host)) {
+          return { trust: SOURCE_TRUST2.MEDIUM, domain: host, reason: "Medium-authority domain (encyclopedia/major news)" };
+        }
+        if (LOW_DOMAIN_RE.test(host)) {
+          return { trust: SOURCE_TRUST2.LOW, domain: host, reason: "Low-authority domain (blog/forum/social)" };
+        }
+        return { trust: SOURCE_TRUST2.MEDIUM, domain: host, reason: "Unknown domain \u2014 medium default" };
+      }
+      /**
+       * Rank results by trust (HIGH first), stable within tiers.
+       *
+       * @param {Array<{url, title, snippet}>} results
+       * @returns {Array<{url, title, snippet, trust, domain}>}
+       */
+      static rank(results) {
+        const ranked = (results || []).map((r) => {
+          const c = _SourceClassifier.classify(r.url);
+          return { ...r, trust: c.trust, domain: c.domain };
+        });
+        const order = { HIGH: 3, MEDIUM: 2, LOW: 1 };
+        ranked.sort((a, b) => (order[b.trust] || 0) - (order[a.trust] || 0));
+        return ranked;
+      }
+    };
+    var DuckDuckGoProvider = class {
+      constructor(fetcher) {
+        this.fetcher = fetcher;
+      }
+      /**
+       * Search DuckDuckGo Lite HTML endpoint (no API key).
+       *
+       * @param {string} query
+       * @param {number} maxResults
+       * @returns {Promise<Array<{url, title, snippet}>>}
+       */
+      async search(query, maxResults = 10) {
+        const url = "https://html.duckduckgo.com/html/?q=" + encodeURIComponent(query);
+        const html = await this.fetcher(url);
+        const results = [];
+        const linkRe = /<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
+        const snippetRe = /<a[^>]+class="result__snippet"[^>]*>([\s\S]*?)<\/a>/gi;
+        const links = [];
+        let m;
+        while ((m = linkRe.exec(html)) !== null && links.length < maxResults) {
+          links.push({ href: decodeEntities(m[1]), title: stripHtml(decodeEntities(m[2])) });
+        }
+        const snippets = [];
+        while ((m = snippetRe.exec(html)) !== null && snippets.length < maxResults) {
+          snippets.push(stripHtml(decodeEntities(m[1])));
+        }
+        for (let i = 0; i < links.length; i++) {
+          const url2 = cleanSearchUrl(links[i].href);
+          if (!url2) continue;
+          results.push({
+            url: url2,
+            title: links[i].title || "(untitled)",
+            snippet: snippets[i] || ""
+          });
+        }
+        return results.slice(0, maxResults);
+      }
+    };
+    var SearXNGProvider = class {
+      constructor(fetcher, baseUrl, categories = "general", maxResults = 10) {
+        this.fetcher = fetcher;
+        this.baseUrl = (baseUrl || "").replace(/\/+$/, "");
+        this.categories = categories || "general";
+        this.maxResults = maxResults || 10;
+      }
+      /**
+       * Search a SearXNG instance JSON API.
+       * User-specified endpoint — self-hosted OR third-party.
+       * The user owns responsibility for the endpoint they configure.
+       *
+       * GET {baseUrl}/search?q={query}&format=json&categories={categories}
+       *
+       * @param {string} query
+       * @returns {Promise<Array<{url, title, snippet}>>}
+       */
+      async search(query) {
+        if (!this.baseUrl) {
+          throw new Error('SearXNG URL not configured. Set "SearXNG URL" in Vault Scholar settings.');
+        }
+        const url = this.baseUrl + "/search?q=" + encodeURIComponent(query) + "&format=json&categories=" + encodeURIComponent(this.categories);
+        const json = await this.fetcher(url);
+        let data;
+        try {
+          data = typeof json === "string" ? JSON.parse(json) : json;
+        } catch (e) {
+          throw new Error("SearXNG returned invalid JSON \u2014 check that the endpoint supports /search?format=json");
+        }
+        const rawResults = data && data.results || [];
+        const results = [];
+        for (const r of rawResults) {
+          const u = normalizeUrl(r.url);
+          if (!u) continue;
+          results.push({
+            url: u,
+            title: stripHtml(decodeEntities(r.title || "(untitled)")),
+            snippet: stripHtml(decodeEntities(r.content || r.snippet || ""))
+          });
+          if (results.length >= this.maxResults) break;
+        }
+        return results;
+      }
+    };
+    function createSearchProvider(providerName, fetcher, settings = {}) {
+      const name = String(providerName || "duckduckgo").toLowerCase();
+      if (name === "searxng") {
+        return new SearXNGProvider(fetcher, settings.searxngUrl, settings.searxngCategories, settings.searxngMaxResults);
+      }
+      return new DuckDuckGoProvider(fetcher);
+    }
+    function cleanSearchUrl(href) {
+      if (!href) return null;
+      const uddg = /[?&]uddg=([^&]+)/.exec(href);
+      if (uddg) {
+        try {
+          return decodeURIComponent(uddg[1]);
+        } catch (e) {
+        }
+      }
+      return normalizeUrl(href);
+    }
+    var MAX_FETCH_BYTES = 1024 * 1024;
+    var ResearchMode2 = class {
+      constructor(deps = {}) {
+        this.fetcher = deps.createFetcher ? deps.createFetcher() : null;
+        this.generate = deps.generate || null;
+        this.modelId = deps.modelId || "qwen3:8b";
+        this.settings = Object.assign({
+          searchProvider: "duckduckgo",
+          searxngUrl: "",
+          searxngCategories: "general",
+          searxngMaxResults: 10,
+          maxSources: 5,
+          maxSearchResults: 10
+        }, deps.settings || {});
+        this.trustBoundary = deps.trustBoundary || null;
+        this._lastState = null;
+      }
+      /**
+       * Run the full research pipeline.
+       *
+       * @param {string} question
+       * @param {Object} opts - { onStage(stageName, stage) } progress callback
+       * @returns {Promise<Object>} final pipeline state
+       */
+      async research(question, opts = {}) {
+        const state = {
+          question: String(question || "").trim(),
+          stages: {},
+          sources: [],
+          rankedSources: [],
+          retrieved: [],
+          extracted: [],
+          contradictions: [],
+          answer: "",
+          citations: [],
+          vaultProposal: "",
+          errors: []
+        };
+        const runStage = async (name, fn) => {
+          try {
+            state.stages[name] = { status: "running" };
+            if (opts.onStage) opts.onStage(name, state.stages[name]);
+            const result = await fn();
+            state.stages[name] = { status: "done", ...result };
+            if (opts.onStage) opts.onStage(name, state.stages[name]);
+            return result;
+          } catch (e) {
+            state.stages[name] = { status: "error", error: e.message };
+            state.errors.push(name + ": " + e.message);
+            throw e;
+          }
+        };
+        const expansions = await runStage("queryExpansion", () => this.queryExpansion(state.question));
+        state.stages.queryExpansion.queries = expansions;
+        const allRaw = [];
+        for (const q of expansions) {
+          const raw = await runStage("internetSearch", () => this.internetSearch(q));
+          allRaw.push(...raw);
+        }
+        const seenUrls = /* @__PURE__ */ new Set();
+        state.sources = allRaw.filter((s) => {
+          if (!s || !s.url || seenUrls.has(s.url)) return false;
+          seenUrls.add(s.url);
+          return true;
+        });
+        await runStage("sourceDiscovery", () => {
+          const ranked = SourceClassifier2.rank(state.sources).slice(0, this.settings.maxSources || 5);
+          state.rankedSources = ranked;
+          return { count: ranked.length, top: ranked.slice(0, 3) };
+        });
+        await this.continueResearch(state, opts, runStage);
+        this._lastState = state;
+        return state;
+      }
+      /**
+       * Pipeline stages 5-12 (continued from research()).
+       * Kept as a separate method so research() stays readable.
+       *
+       * @param {Object} state - Pipeline state (mutable)
+       * @param {Object} opts - { onStage } callback
+       * @param {Function} runStage - Stage runner from research()
+       */
+      async continueResearch(state, opts, runStage) {
+        await runStage("sourceRetrieval", async () => {
+          const retrieved = [];
+          for (const src of state.rankedSources) {
+            try {
+              const text = await this.retrieveSource(src.url);
+              retrieved.push({ ...src, content: text });
+            } catch (e) {
+              state.errors.push("retrieve " + src.url + ": " + e.message);
+            }
+          }
+          state.retrieved = retrieved;
+          return { count: retrieved.length };
+        });
+        await runStage("evidenceExtraction", () => {
+          const extracted = this.extractEvidence(state.retrieved);
+          state.extracted = extracted;
+          return { count: extracted.length };
+        });
+        await runStage("contradictionDetection", () => {
+          const contradictions = this.detectContradictions(state.extracted);
+          state.contradictions = contradictions;
+          return { count: contradictions.length, contradictions };
+        });
+        await runStage("answerGeneration", async () => {
+          const answer = await this.generateAnswer(state);
+          state.answer = answer;
+          return { length: answer.length };
+        });
+        await runStage("citationValidation", () => {
+          const citations = this.validateCitations(state.answer, state.retrieved);
+          state.citations = citations;
+          return { count: citations.length, citations };
+        });
+        await runStage("vaultProposal", () => {
+          const proposal = this.buildVaultProposal(state);
+          state.vaultProposal = proposal;
+          const gate = EvidenceGate2.validateNote(proposal);
+          return { proposalLength: proposal.length, gate };
+        });
+      }
+      /**
+       * Stage 1 — Expand the user question into search queries.
+       * Uses the LLM if available; otherwise falls back to keyword variants.
+       *
+       * @param {string} question
+       * @returns {Promise<string[]>}
+       */
+      async queryExpansion(question) {
+        if (this.generate) {
+          const prompt = [
+            "You are a research query expansion assistant.",
+            "Given the user question, generate 3 concise search queries (one per line, no numbering, no bullets).",
+            "",
+            "QUESTION:",
+            question,
+            "",
+            "QUERIES:"
+          ].join("\n");
+          try {
+            const out = await this.generate(this.modelId, prompt, { temperature: 0.3 });
+            const lines = String(out || "").split("\n").map((l) => l.trim()).filter((l) => l && !/^\d+[.)]/.test(l)).slice(0, 5);
+            if (lines.length >= 1) return lines;
+          } catch (e) {
+          }
+        }
+        return [question, question + " research paper", question + " evidence summary"];
+      }
+      /**
+       * Stage 2 — Internet search via the configured provider.
+       * Requires the fetcher; otherwise throws (fail closed).
+       *
+       * @param {string} query
+       * @returns {Promise<Array<{url, title, snippet}>>}
+       */
+      async internetSearch(query) {
+        if (!this.fetcher) {
+          throw new Error("No network fetcher available \u2014 internet search is disabled");
+        }
+        const provider = createSearchProvider(
+          this.settings.searchProvider,
+          this.fetcher,
+          this.settings
+        );
+        const maxResults = this.settings.maxSearchResults || 10;
+        return provider.search(query, maxResults);
+      }
+      /**
+       * Stage 3/4 — Source discovery + trust classification.
+       * Exposed separately for testability; research() uses
+       * SourceClassifier.rank directly.
+       *
+       * @param {Array} sources
+       * @returns {Array} ranked sources with trust metadata
+       */
+      sourceDiscovery(sources) {
+        return SourceClassifier2.rank(sources);
+      }
+      /**
+       * Stage 5 — Retrieve a single source's text content.
+       * Coerces the fetcher result to text; caps at MAX_FETCH_BYTES.
+       *
+       * @param {string} url
+       * @returns {Promise<string>}
+       */
+      async retrieveSource(url) {
+        if (!this.fetcher) throw new Error("No network fetcher available");
+        const raw = await this.fetcher(url);
+        let text;
+        if (typeof raw === "string") {
+          text = stripHtml(raw);
+        } else if (raw && typeof raw === "object" && raw.text !== void 0) {
+          text = stripHtml(String(raw.text));
+        } else {
+          text = stripHtml(String(raw));
+        }
+        return text.slice(0, MAX_FETCH_BYTES);
+      }
+      /**
+       * Stage 7 — Extract evidence (claim-like sentences) from retrieved content.
+       *
+       * @param {Array} retrieved - Sources with { url, title, snippet, content }
+       * @returns {Array<{claim, source, url, trust}>}
+       */
+      extractEvidence(retrieved) {
+        const out = [];
+        for (const src of retrieved || []) {
+          if (!src.content) continue;
+          const sentences = String(src.content).split(/(?<=[.!?])\s+/).map((s) => s.trim()).filter((s) => s.length > 40 && s.length < 400);
+          for (const s of sentences.slice(0, 8)) {
+            out.push({ claim: s, source: src.title || src.url, url: src.url, trust: src.trust || "MEDIUM" });
+          }
+        }
+        return out;
+      }
+      /**
+       * Stage 8-9 — Detect contradictions across sources.
+       * Heuristic: for claims sharing a topic keyword, one negates the other.
+       *
+       * @param {Array} extracted - Evidence items
+       * @returns {Array<{topic, claimA, claimB, urlA, urlB, note}>}
+       */
+      detectContradictions(extracted) {
+        const items = (extracted || []).filter(Boolean);
+        const contradictions = [];
+        const NEGATION = /\b(not|no|never|without|unlike|contrary|invalid|false|disprove|refute|fails?)\b/i;
+        for (let i = 0; i < items.length; i++) {
+          for (let j = i + 1; j < items.length; j++) {
+            const a = items[i];
+            const b = items[j];
+            if (a.url === b.url) continue;
+            const topicA = extractTopic(a.claim);
+            const topicB = extractTopic(b.claim);
+            if (!topicA || topicA !== topicB) continue;
+            const negA = NEGATION.test(a.claim);
+            const negB = NEGATION.test(b.claim);
+            if (negA !== negB) {
+              contradictions.push({
+                topic: topicA,
+                claimA: truncateText(a.claim, 200),
+                claimB: truncateText(b.claim, 200),
+                urlA: a.url,
+                urlB: b.url,
+                note: 'Sources disagree on "' + topicA + '"'
+              });
+            }
+          }
+        }
+        return contradictions.slice(0, 10);
+      }
+      /**
+       * Stage 10 — Generate the final answer.
+       * Requires the LLM; otherwise produces a structured fallback from
+       * the retrieved evidence (still fully source-tagged).
+       *
+       * @param {Object} state - Pipeline state
+       * @returns {Promise<string>}
+       */
+      async generateAnswer(state) {
+        const sourcesText = state.retrieved.map(
+          (s, i) => "[" + (i + 1) + "] " + s.url + "\n" + truncateText(s.content || "", 2e3)
+        ).join("\n\n---\n\n");
+        if (!this.generate) {
+          const lines = [];
+          lines.push("## Answer Summary");
+          lines.push("");
+          for (const e of state.extracted.slice(0, 10)) {
+            lines.push("- " + e.claim + " [SOURCE: " + e.url + "]");
+          }
+          if (state.contradictions.length > 0) {
+            lines.push("");
+            lines.push("## Contradictions Found");
+            lines.push("");
+            for (const c of state.contradictions) {
+              lines.push("- [CONTRADICTION: " + truncateText(c.topic, 120) + "]");
+              lines.push("  - " + truncateText(c.claimA, 150) + " (" + c.urlA + ")");
+              lines.push("  - " + truncateText(c.claimB, 150) + " (" + c.urlB + ")");
+            }
+          }
+          return lines.join("\n");
+        }
+        const prompt = [
+          "You are a rigorous research assistant. Synthesize an evidence-based answer.",
+          "IMPORTANT: Every factual claim must be followed by a source citation in the form [SOURCE: url].",
+          "If any retrieved source contradicts another, state the contradiction explicitly with [CONTRADICTION: ...].",
+          "Do not invent sources. Only cite the URLs provided below.",
+          "",
+          "QUESTION:",
+          state.question,
+          "",
+          "RETRIEVED SOURCES:",
+          sourcesText,
+          "",
+          "Provide:",
+          "1. Executive summary",
+          "2. Key findings (each cited with [SOURCE: url])",
+          "3. Contradictions (if any) with [CONTRADICTION: ...]",
+          "4. Gaps and open questions",
+          "",
+          "ANSWER:"
+        ].join("\n");
+        const answer = await this.generate(this.modelId, prompt, {
+          temperature: 0.2,
+          numCtx: this.settings.numCtxLong || 8192
+        });
+        return String(answer || "").trim();
+      }
+      /**
+       * Stage 11 — Validate citations: only URLs that were actually
+       * retrieved in this run survive. Others are dropped.
+       *
+       * @param {string} answer
+       * @param {Array} retrieved - Retrieved sources with url
+       * @returns {string[]}
+       */
+      validateCitations(answer, retrieved) {
+        const validUrls = new Set((retrieved || []).map((s) => s.url).filter(Boolean));
+        const cited = [];
+        const re = /\[SOURCE:\s*([^\]]+)\]/gi;
+        let m;
+        while ((m = re.exec(String(answer || ""))) !== null) {
+          const raw = m[1].trim();
+          for (const part of raw.split(",")) {
+            const u = normalizeUrl(part.trim());
+            if (u && validUrls.has(u) && !cited.includes(u)) cited.push(u);
+          }
+        }
+        return cited;
+      }
+      /**
+       * Stage 12 — Build an evidence-gated markdown vault proposal.
+       *
+       * @param {Object} state - Pipeline state
+       * @returns {string}
+       */
+      buildVaultProposal(state) {
+        const lines = [];
+        lines.push("---");
+        lines.push("title: " + summarize(state.question, 60));
+        lines.push("type: research");
+        lines.push("created: " + (/* @__PURE__ */ new Date()).toISOString().slice(0, 10));
+        lines.push("research-provider: " + (this.settings.searchProvider || "duckduckgo"));
+        lines.push("sources: " + state.retrieved.length);
+        lines.push("tags:");
+        lines.push("  - research");
+        lines.push("---");
+        lines.push("");
+        lines.push("# " + summarize(state.question, 80));
+        lines.push("");
+        lines.push("## Answer Summary");
+        lines.push("");
+        for (const e of state.extracted.slice(0, 10)) {
+          lines.push("- " + e.claim + " [SOURCE: " + e.url + "]");
+        }
+        if (state.contradictions.length > 0) {
+          lines.push("");
+          lines.push("## Contradictions");
+          lines.push("");
+          for (const c of state.contradictions) {
+            lines.push("- [CONTRADICTION: " + truncateText(c.topic, 120) + "]");
+            lines.push("  - " + truncateText(c.claimA, 150) + " (" + c.urlA + ")");
+            lines.push("  - " + truncateText(c.claimB, 150) + " (" + c.urlB + ")");
+          }
+        }
+        lines.push("");
+        lines.push("## Sources");
+        lines.push("");
+        for (const s of state.retrieved) {
+          lines.push("- [" + s.title + "](" + s.url + ") \u2014 trust: " + (s.trust || "MEDIUM"));
+        }
+        lines.push("");
+        lines.push("## Evidence Gate");
+        lines.push("");
+        lines.push("> This proposal was produced by Research Mode. Each factual claim is");
+        lines.push("> tagged with its source. Claims without sources are BLOCKED by the");
+        lines.push("> Evidence Gate before this document may enter the vault.");
+        return lines.join("\n") + "\n";
+      }
+    };
+    function extractTopic(claim) {
+      const t = String(claim || "").trim();
+      const words = t.replace(/[^a-zA-Z0-9\s-]/g, " ").split(/\s+/).filter((w) => w.length > 3);
+      if (words.length === 0) return "";
+      for (let n = 3; n >= 2; n--) {
+        for (let i = 0; i + n <= words.length; i++) {
+          const phrase = words.slice(i, i + n).join(" ").toLowerCase();
+          if (phrase.length > 8) return phrase;
+        }
+      }
+      return words[0].toLowerCase();
+    }
+    function truncateText(str, max) {
+      return String(str || "").length > max ? String(str || "").slice(0, max) + "\u2026" : String(str || "");
+    }
+    function summarize(str, max) {
+      return truncateText(String(str || "").trim(), max);
+    }
+    module2.exports = {
+      ResearchMode: ResearchMode2,
+      SourceClassifier: SourceClassifier2,
+      SOURCE_TRUST: SOURCE_TRUST2,
+      DuckDuckGoProvider,
+      SearXNGProvider,
+      createSearchProvider,
+      maxFetchBytes: MAX_FETCH_BYTES
+    };
+  }
+});
+
+// src/main.ts
+var { Plugin, PluginSettingTab, Setting, Notice, Modal, App, MarkdownView, requestUrl, Platform } = require("obsidian");
+var { exec, execFile, spawn } = require("child_process");
+var fs = require("fs");
+var path = require("path");
+var crypto = require("crypto");
+var { TRUST_LEVELS, CONTENT_SOURCES, TrustClassifier, TrustBoundary } = require_trust();
+var { EvidenceGate, CLAIM_ORIGIN, EVIDENCE_MARKERS } = require_evidence();
+var { ResearchMode, SourceClassifier, SOURCE_TRUST } = require_research();
+var OLLAMA_HOST = "http://localhost:11434";
+var PLUGIN_ID = "vault-scholar";
+var MODELS = {
+  safe: { id: "qwen3:8b", role: "\u{1F7E2} Safe / Everyday", default: true },
+  deep: { id: "gemma4:12b", role: "\u{1F9E0} Deep Reasoning", default: false },
+  math: { id: "mathstral:latest", role: "\u2797 Math / Science", default: false },
+  coder: { id: "huihui_ai/qwen2.5-coder-abliterate:7b", role: "\u{1F4BB} Coding / Security", default: false },
+  embedding: { id: "qwen3-embedding:0.6b", role: "\u{1F50E} Embeddings", default: true }
+};
+var DEFAULT_SETTINGS = {
+  // Security
+  safeMode: true,
+  internetResearch: false,
+  vaultWriteApproval: true,
+  scriptExecutionApproval: true,
+  verifyExternalBeforeWrite: true,
+  sandboxMode: "python",
+  // 'python' | 'node' | 'docker'
+  // Trust Boundary
+  trustEnforcement: true,
+  trustThreshold: TRUST_LEVELS.VERIFIED,
+  trustDisplay: true,
+  // Models
+  activeModel: MODELS.safe.id,
+  // Context
+  numCtx: 4096,
+  numCtxLong: 8192,
+  // VRAM
+  keepEmbeddingsLoaded: true,
+  // Provenance
+  provenanceEnabled: true,
+  // Snapshots
+  autoSnapshotBeforeRisky: true,
+  snapshotMaxCount: 20,
+  // RAG
+  ragEnabled: true,
+  // Evidence-Gated Knowledge
+  evidenceGating: true,
+  // Research Mode
+  researchModeEnabled: true,
+  searchProvider: "duckduckgo",
+  searxngUrl: "",
+  searxngCategories: "general",
+  searxngMaxResults: 10,
+  maxSources: 5,
+  maxSearchResults: 10,
+  // Ollama
+  ollamaHost: OLLAMA_HOST
+};
+function hashString(str) {
+  return crypto.createHash("sha256").update(str).digest("hex");
+}
+function nowISO() {
+  return (/* @__PURE__ */ new Date()).toISOString();
+}
+function sanitizeFilename(name) {
+  return name.replace(/[^a-zA-Z0-9-_]/g, "_").slice(0, 60);
+}
+function truncate(str, max) {
+  if (!str) return "";
+  return str.length > max ? str.slice(0, max) + "\u2026" : str;
+}
+var OllamaClient = class {
+  constructor(plugin) {
+    this.plugin = plugin;
+    this.host = plugin.settings.ollamaHost;
+  }
+  async request(endpoint, body) {
+    const url = `${this.host}${endpoint}`;
+    const res = await requestUrl({
+      url,
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      throw: false
+    });
+    if (res.status >= 400) {
+      throw new Error(`Ollama error ${res.status}: ${res.text}`);
+    }
+    return res.json;
+  }
+  async chat(model, messages, opts = {}) {
+    var _a;
+    const body = {
+      model,
+      messages,
+      stream: false,
+      options: {
+        num_ctx: opts.numCtx || this.plugin.settings.numCtx,
+        temperature: (_a = opts.temperature) != null ? _a : 0.7
+      }
+    };
+    if (opts.keepAlive) body.keep_alive = opts.keepAlive;
+    const res = await this.request("/api/chat", body);
+    return res.message ? res.message.content : "";
+  }
+  async generate(model, prompt, opts = {}) {
+    var _a;
+    const body = {
+      model,
+      prompt,
+      stream: false,
+      options: {
+        num_ctx: opts.numCtx || this.plugin.settings.numCtx,
+        temperature: (_a = opts.temperature) != null ? _a : 0.7
+      }
+    };
+    if (opts.keepAlive) body.keep_alive = opts.keepAlive;
+    const res = await this.request("/api/generate", body);
+    return res.response || "";
+  }
+  async embed(texts) {
+    const res = await this.request("/api/embed", {
+      model: MODELS.embedding.id,
+      input: Array.isArray(texts) ? texts : [texts]
+    });
+    return res.embeddings || [];
+  }
+  async listModels() {
+    const res = await this.request("/api/tags", {});
+    return res.models || [];
+  }
+  async ps() {
+    const res = await this.request("/api/ps", {});
+    return res.models || [];
+  }
+  async show(model) {
+    const res = await this.request("/api/show", { model });
+    return res;
+  }
+  async pull(model) {
+    const res = await this.request("/api/pull", { model, stream: false });
+    return res;
+  }
+  async unload(model) {
+    try {
+      await this.request("/api/generate", { model, keep_alive: 0, prompt: "" });
+    } catch (e) {
+    }
+  }
+};
+var ModelManager = class {
+  constructor(plugin) {
+    this.plugin = plugin;
+    this.client = plugin.ollama;
+    this.activeModel = plugin.settings.activeModel;
+    this.semanticMemory = "";
+  }
+  async switchTo(modelId, opts = {}) {
+    if (modelId === this.activeModel && !opts.force) return;
+    this.semanticMemory = this.plugin.workingMemory || "";
+    await this.client.unload(this.activeModel);
+    await this.client.generate(modelId, "Hello", { keepAlive: "5m" });
+    this.activeModel = modelId;
+    this.plugin.settings.activeModel = modelId;
+    await this.plugin.saveSettings();
+    this.plugin.updateStatusBar();
+    new Notice(`\u{1F9E0} Model switched to: ${modelId}`);
+  }
+  async ensureEmbeddingsLoaded() {
+    if (!this.plugin.settings.keepEmbeddingsLoaded) return;
+    try {
+      await this.client.embed(["warmup"]);
+    } catch (e) {
+    }
+  }
+};
+var TaskRouter = class {
+  constructor(plugin) {
+    this.plugin = plugin;
+  }
+  classify(input) {
+    const text = input.toLowerCase();
+    const rules = [
+      { model: "math", pattern: /(derive|derivation|integral|derivative|equation|solve|proof|theorem|calculus|algebra|physics|symmetry|invariant|lagrangian|hamiltonian|schr|maxwell|newton|fourier|laplace|eigen|tensor|vector field|differential)/ },
+      { model: "coder", pattern: /(code|script|debug|vulnerab|security|exploit|function|class|api|syntax|error|bug|simulation script|python|javascript|typescript|sql|regex|audit)/ },
+      { model: "deep", pattern: /(research|synthesize|analyze|compare|evaluate|critique|literature|paper|theory|concept|explain in depth|reason)/ }
+    ];
+    for (const rule of rules) {
+      if (rule.pattern.test(text)) return rule.model;
+    }
+    return "safe";
+  }
+  async route(input, opts = {}) {
+    const target = opts.model || this.classify(input);
+    const modelId = MODELS[target] ? MODELS[target].id : target;
+    await this.plugin.modelManager.switchTo(modelId);
+    return { target, modelId };
+  }
+};
+var ProvenanceEngine = class {
+  constructor(plugin) {
+    this.plugin = plugin;
+    this.dir = path.join(plugin.assetsDir, "provenance");
+    this.logFile = path.join(this.dir, "provenance.jsonl");
+  }
+  init() {
+    if (!fs.existsSync(this.dir)) fs.mkdirSync(this.dir, { recursive: true });
+  }
+  async record(entry) {
+    var _a;
+    if (!this.plugin.settings.provenanceEnabled) return;
+    this.init();
+    const trust = TrustClassifier.classify(entry.content || "", {
+      source: entry.contentSource || CONTENT_SOURCES.AI_GENERATED,
+      trustLevel: entry.trustLevel,
+      verifiedBy: entry.verifiedBy,
+      confidence: entry.confidence,
+      citations: entry.citations || [],
+      model: entry.model || this.plugin.modelManager.activeModel,
+      metadata: entry.metadata || {}
+    });
+    const record = {
+      id: hashString(nowISO() + Math.random()),
+      timestamp: nowISO(),
+      type: entry.type || "claim",
+      content: entry.content || "",
+      sourceNote: entry.sourceNote || null,
+      model: entry.model || this.plugin.modelManager.activeModel,
+      citations: entry.citations || [],
+      verified: (_a = entry.verified) != null ? _a : trust.verified,
+      verificationMethod: entry.verificationMethod || null,
+      hash: hashString(entry.content || ""),
+      metadata: entry.metadata || {},
+      // Trust Boundary metadata
+      trustLevel: trust.trustLevel,
+      contentSource: trust.contentSource,
+      confidence: trust.confidence,
+      verifiedBy: trust.verifiedBy
+    };
+    fs.appendFileSync(this.logFile, JSON.stringify(record) + "\n");
+    return record;
+  }
+  async getAll() {
+    if (!fs.existsSync(this.logFile)) return [];
+    const lines = fs.readFileSync(this.logFile, "utf8").split("\n").filter(Boolean);
+    return lines.map((l) => {
+      try {
+        return JSON.parse(l);
+      } catch (e) {
+        return null;
+      }
+    }).filter(Boolean);
+  }
+  async getByType(type) {
+    const all = await this.getAll();
+    return all.filter((r) => r.type === type);
+  }
+};
+var SnapshotManager = class {
+  constructor(plugin) {
+    this.plugin = plugin;
+    this.dir = path.join(plugin.assetsDir, "snapshots");
+  }
+  init() {
+    if (!fs.existsSync(this.dir)) fs.mkdirSync(this.dir, { recursive: true });
+  }
+  async createSnapshot(label = "manual") {
+    this.init();
+    const vaultPath = this.plugin.app.vault.adapter.getBasePath();
+    const ts = (/* @__PURE__ */ new Date()).toISOString().replace(/[:.]/g, "-");
+    const name = `${ts}_${sanitizeFilename(label)}`;
+    const dest = path.join(this.dir, name);
+    fs.mkdirSync(dest, { recursive: true });
+    const exclude = /* @__PURE__ */ new Set([".obsidian", ".trash", ".git", ".copilot-index", ".megaignore"]);
+    const copyRecursive = (src, dst) => {
+      const entries = fs.readdirSync(src, { withFileTypes: true });
+      for (const entry of entries) {
+        if (exclude.has(entry.name)) continue;
+        const srcPath = path.join(src, entry.name);
+        const dstPath = path.join(dst, entry.name);
+        if (entry.isDirectory()) {
+          fs.mkdirSync(dstPath, { recursive: true });
+          copyRecursive(srcPath, dstPath);
+        } else {
+          fs.copyFileSync(srcPath, dstPath);
+        }
+      }
+    };
+    copyRecursive(vaultPath, dest);
+    const snapshots = fs.readdirSync(this.dir).filter((f) => fs.statSync(path.join(this.dir, f)).isDirectory());
+    const max = this.plugin.settings.snapshotMaxCount;
+    if (snapshots.length > max) {
+      const toRemove = snapshots.sort().slice(0, snapshots.length - max);
+      for (const s of toRemove) {
+        fs.rmSync(path.join(this.dir, s), { recursive: true, force: true });
+      }
+    }
+    new Notice(`\u{1F4F8} Snapshot created: ${name}`);
+    return name;
+  }
+  listSnapshots() {
+    if (!fs.existsSync(this.dir)) return [];
+    return fs.readdirSync(this.dir).filter((f) => fs.statSync(path.join(this.dir, f)).isDirectory()).sort().reverse();
+  }
+  async restoreSnapshot(name) {
+    const src = path.join(this.dir, name);
+    if (!fs.existsSync(src)) {
+      new Notice("\u274C Snapshot not found");
+      return false;
+    }
+    const vaultPath = this.plugin.app.vault.adapter.getBasePath();
+    const exclude = /* @__PURE__ */ new Set([".obsidian", ".trash", ".git", ".copilot-index"]);
+    const copyRecursive = (srcDir, dstDir) => {
+      const entries = fs.readdirSync(srcDir, { withFileTypes: true });
+      for (const entry of entries) {
+        if (exclude.has(entry.name)) continue;
+        const srcPath = path.join(srcDir, entry.name);
+        const dstPath = path.join(dstDir, entry.name);
+        if (entry.isDirectory()) {
+          fs.mkdirSync(dstPath, { recursive: true });
+          copyRecursive(srcPath, dstPath);
+        } else {
+          fs.copyFileSync(srcPath, dstPath);
+        }
+      }
+    };
+    copyRecursive(src, vaultPath);
+    new Notice(`\u267B\uFE0F Restored snapshot: ${name}`);
+    return true;
+  }
+};
+var RAGEngine = class {
+  constructor(plugin) {
+    this.plugin = plugin;
+    this.dir = path.join(plugin.assetsDir, "vectorstore");
+    this.indexFile = path.join(this.dir, "index.json");
+    this.index = { chunks: [], embeddings: [] };
+  }
+  init() {
+    if (!fs.existsSync(this.dir)) fs.mkdirSync(this.dir, { recursive: true });
+    if (fs.existsSync(this.indexFile)) {
+      try {
+        this.index = JSON.parse(fs.readFileSync(this.indexFile, "utf8"));
+      } catch (e) {
+        this.index = { chunks: [], embeddings: [] };
+      }
+    }
+  }
+  save() {
+    fs.writeFileSync(this.indexFile, JSON.stringify(this.index));
+  }
+  async indexNote(note) {
+    if (!this.plugin.settings.ragEnabled) return;
+    this.init();
+    const content = note.content || "";
+    if (content.length < 50) return;
+    const chunks = [];
+    const paragraphs = content.split(/\n\s*\n/);
+    let current = "";
+    for (const p of paragraphs) {
+      if ((current + p).length > 500) {
+        if (current) chunks.push(current.trim());
+        current = p;
+      } else {
+        current += "\n\n" + p;
+      }
+    }
+    if (current) chunks.push(current.trim());
+    const embeddings = await this.plugin.ollama.embed(chunks);
+    for (let i = 0; i < chunks.length; i++) {
+      this.index.chunks.push({
+        text: chunks[i],
+        note: note.path,
+        hash: hashString(chunks[i])
+      });
+      this.index.embeddings.push(embeddings[i]);
+    }
+    this.save();
+  }
+  async indexVault() {
+    const files = this.plugin.app.vault.getMarkdownFiles();
+    for (const file of files) {
+      const content = await this.plugin.app.vault.cachedRead(file);
+      await this.indexNote({ path: file.path, content });
+    }
+    new Notice(`\u{1F50E} Indexed ${files.length} notes`);
+  }
+  cosineSim(a, b) {
+    if (!a || !b || a.length !== b.length) return 0;
+    let dot = 0, na = 0, nb = 0;
+    for (let i = 0; i < a.length; i++) {
+      dot += a[i] * b[i];
+      na += a[i] * a[i];
+      nb += b[i] * b[i];
+    }
+    if (na === 0 || nb === 0) return 0;
+    return dot / (Math.sqrt(na) * Math.sqrt(nb));
+  }
+  async search(query, topK = 5) {
+    this.init();
+    if (this.index.embeddings.length === 0) return [];
+    const [qEmbed] = await this.plugin.ollama.embed([query]);
+    const scored = this.index.embeddings.map((emb, i) => ({
+      score: this.cosineSim(qEmbed, emb),
+      chunk: this.index.chunks[i]
+    }));
+    scored.sort((a, b) => b.score - a.score);
+    return scored.slice(0, topK).filter((r) => r.score > 0.3);
+  }
+};
+var SandboxManager = class {
+  constructor(plugin) {
+    this.plugin = plugin;
+    this.dir = path.join(plugin.assetsDir, "sandbox");
+    this.tempDir = path.join(this.dir, "tmp");
+  }
+  init() {
+    if (!fs.existsSync(this.dir)) fs.mkdirSync(this.dir, { recursive: true });
+    if (!fs.existsSync(this.tempDir)) fs.mkdirSync(this.tempDir, { recursive: true });
+  }
+  async runPython(code, opts = {}) {
+    this.init();
+    const timeout = opts.timeout || 15e3;
+    const scriptFile = path.join(this.tempDir, `script_${Date.now()}.py`);
+    fs.writeFileSync(scriptFile, code);
+    return new Promise((resolve) => {
+      const child = spawn("python", [scriptFile], {
+        cwd: this.tempDir,
+        env: { ...process.env, PYTHONNOUSERSITE: "1" },
+        windowsHide: true
+      });
+      let stdout = "", stderr = "";
+      const timer = setTimeout(() => {
+        child.kill("SIGKILL");
+        resolve({ ok: false, stdout, stderr: stderr + "\n[Timeout: killed after " + timeout + "ms]", timedOut: true });
+      }, timeout);
+      child.stdout.on("data", (d) => stdout += d.toString());
+      child.stderr.on("data", (d) => stderr += d.toString());
+      child.on("close", (code2) => {
+        clearTimeout(timer);
+        fs.unlinkSync(scriptFile);
+        resolve({ ok: code2 === 0, stdout, stderr, exitCode: code2 });
+      });
+    });
+  }
+  async runNode(code, opts = {}) {
+    const vm = require("vm");
+    const timeout = opts.timeout || 5e3;
+    const sandbox = {
+      console: {
+        log: (...args) => {
+          this._nodeOutput += args.map((a) => typeof a === "object" ? JSON.stringify(a) : String(a)).join(" ") + "\n";
+        },
+        error: (...args) => {
+          this._nodeError += args.map((a) => String(a)).join(" ") + "\n";
+        }
+      },
+      Math,
+      JSON,
+      Date,
+      Array,
+      Object,
+      String,
+      Number,
+      Boolean,
+      parseInt,
+      parseFloat,
+      isNaN,
+      isFinite
+    };
+    this._nodeOutput = "";
+    this._nodeError = "";
+    try {
+      vm.createContext(sandbox);
+      const result = vm.runInContext(code, sandbox, { timeout });
+      return { ok: true, stdout: this._nodeOutput, stderr: this._nodeError, result: result !== void 0 ? String(result) : "" };
+    } catch (e) {
+      return { ok: false, stdout: this._nodeOutput, stderr: this._nodeError + "\n" + e.message };
+    }
+  }
+  async runDocker(code, opts = {}) {
+    this.init();
+    const timeout = opts.timeout || 2e4;
+    const scriptFile = path.join(this.tempDir, `script_${Date.now()}.py`);
+    fs.writeFileSync(scriptFile, code);
+    return new Promise((resolve) => {
+      const cmd = `docker run --rm --network none --memory 512m --cpus 1 -v "${scriptFile}:/app/script.py:ro" python:3-slim python /app/script.py`;
+      exec(cmd, { timeout, windowsHide: true }, (err, stdout, stderr) => {
+        fs.unlinkSync(scriptFile);
+        resolve({ ok: !err, stdout, stderr: stderr || (err ? err.message : ""), exitCode: err ? err.code : 0 });
+      });
+    });
+  }
+  async run(code, language = "python", opts = {}) {
+    const mode = this.plugin.settings.sandboxMode;
+    if (mode === "docker") {
+      return this.runDocker(code, opts);
+    } else if (language === "javascript" || language === "js") {
+      return this.runNode(code, opts);
+    }
+    return this.runPython(code, opts);
+  }
+};
+var _CodeAuditor = class _CodeAuditor {
+  constructor(plugin) {
+    this.plugin = plugin;
+  }
+  staticScan(code) {
+    const findings = [];
+    for (const p of _CodeAuditor.patterns) {
+      const matches = code.match(p.pattern);
+      if (matches) {
+        findings.push({ name: p.name, severity: p.severity, match: matches[0] });
+      }
+    }
+    return findings;
+  }
+  async audit(code, language = "python") {
+    const staticFindings = this.staticScan(code);
+    const prompt = `You are a security auditor. Analyze this ${language} code for vulnerabilities, security issues, and bugs.
+
+CODE:
+\`\`\`${language}
+${code}
+\`\`\`
+
+Respond with a structured list of findings. For each finding include:
+- Severity (critical/high/medium/low)
+- Location (line or function)
+- Description
+- Recommended fix
+
+If no issues found, say "No vulnerabilities detected."
+
+FINDINGS:`;
+    const modelId = MODELS.coder.id;
+    const aiAnalysis = await this.plugin.ollama.generate(modelId, prompt, { numCtx: this.plugin.settings.numCtxLong });
+    return { staticFindings, aiAnalysis };
+  }
+};
+_CodeAuditor.patterns = [
+  { name: "SQL Injection", pattern: /(SELECT|INSERT|UPDATE|DELETE).*(\+|\$\{).*(WHERE|VALUES)/i, severity: "critical" },
+  { name: "Command Injection", pattern: /(exec|system|popen|spawn|shell_exec|eval)\s*\(/i, severity: "critical" },
+  { name: "Path Traversal", pattern: /(\.\.\/|\.\.\\)/, severity: "high" },
+  { name: "Hardcoded Secret", pattern: /(password|secret|api[_-]?key|token)\s*[=:]\s*['"][^'"]{8,}['"]/i, severity: "high" },
+  { name: "Insecure Deserialization", pattern: /(pickle\.loads|eval\(|Function\(|new Function)/, severity: "high" },
+  { name: "Unsafe Eval", pattern: /\beval\s*\(/, severity: "high" },
+  { name: "Weak Crypto", pattern: /(md5|sha1|DES|RC4)\s*\(/i, severity: "medium" },
+  { name: "Insecure Random", pattern: /(Math\.random|random\(\))/, severity: "low" },
+  { name: "Buffer Overflow Risk", pattern: /(strcpy|strcat|sprintf|gets)\s*\(/, severity: "critical" },
+  { name: "Race Condition", pattern: /(thread|fork|spawn).*(shared|global|static)/i, severity: "medium" },
+  { name: "Unvalidated Input", pattern: /(input\(|getParameter|request\.get|req\.query|req\.body)/i, severity: "medium" },
+  { name: "Insecure File Write", pattern: /(open\(.*['"]w['"]|writeFile|fwrite)/i, severity: "medium" }
+];
+var CodeAuditor = _CodeAuditor;
+var MathPhysicsEngine = class {
+  constructor(plugin) {
+    this.plugin = plugin;
+  }
+  async derive(problem, opts = {}) {
+    const prompt = `You are a rigorous mathematician and physicist. Derive the solution to the following problem step-by-step, showing every step clearly.
+
+PROBLEM:
+${problem}
+
+${opts.context ? "CONTEXT:\n" + opts.context + "\n" : ""}
+
+Provide:
+1. Problem restatement
+2. Step-by-step derivation (each step numbered and explained)
+3. Final result
+4. Verification / sanity check
+5. Any assumptions made
+
+DERIVATION:`;
+    const modelId = MODELS.math.id;
+    const result = await this.plugin.ollama.generate(modelId, prompt, { numCtx: this.plugin.settings.numCtxLong });
+    await this.plugin.provenance.record({
+      type: "derivation",
+      content: result,
+      sourceNote: opts.sourceNote || null,
+      model: modelId,
+      contentSource: CONTENT_SOURCES.MATH_DERIVED,
+      trustLevel: TRUST_LEVELS.INFERRED,
+      metadata: { problem }
+    });
+    return result;
+  }
+  async analyzePatterns(input, opts = {}) {
+    const prompt = `You are an expert in mathematical and physical pattern recognition. Analyze the following for logical patterns, symmetries, and invariants.
+
+INPUT:
+${input}
+
+${opts.context ? "CONTEXT:\n" + opts.context + "\n" : ""}
+
+Provide:
+1. Detected patterns
+2. Symmetries (if any)
+3. Invariants (quantities that don't change)
+4. Conservation laws (if applicable)
+5. Implications
+
+ANALYSIS:`;
+    const modelId = MODELS.math.id;
+    const result = await this.plugin.ollama.generate(modelId, prompt, { numCtx: this.plugin.settings.numCtxLong });
+    await this.plugin.provenance.record({
+      type: "pattern_analysis",
+      content: result,
+      sourceNote: opts.sourceNote || null,
+      model: modelId,
+      contentSource: CONTENT_SOURCES.AI_GENERATED,
+      trustLevel: TRUST_LEVELS.INFERRED,
+      metadata: { input }
+    });
+    return result;
+  }
+};
+var SimulationEngine = class {
+  constructor(plugin) {
+    this.plugin = plugin;
+  }
+  async generateSpec(description, opts = {}) {
+    const prompt = `You are a simulation specification generator. Create a detailed, executable simulation specification from the following description.
+
+DESCRIPTION:
+${description}
+
+${opts.context ? "CONTEXT:\n" + opts.context + "\n" : ""}
+
+Generate a structured specification with:
+1. Simulation name and purpose
+2. Physical/mathematical model (equations)
+3. Initial conditions
+4. Parameters and constants
+5. Numerical method (e.g., Euler, RK4)
+6. Time stepping (dt, total time)
+7. Outputs and visualizations
+8. Validation criteria
+
+SPECIFICATION:`;
+    const modelId = MODELS.math.id;
+    const result = await this.plugin.ollama.generate(modelId, prompt, { numCtx: this.plugin.settings.numCtxLong });
+    await this.plugin.provenance.record({
+      type: "simulation_spec",
+      content: result,
+      sourceNote: opts.sourceNote || null,
+      model: modelId,
+      contentSource: CONTENT_SOURCES.AI_GENERATED,
+      trustLevel: TRUST_LEVELS.INFERRED,
+      metadata: { description }
+    });
+    return result;
+  }
+  async buildScript(spec, language = "python", opts = {}) {
+    const prompt = `You are an expert simulation coder. Write a complete, runnable ${language} script that implements the following simulation specification.
+
+SPECIFICATION:
+${spec}
+
+Requirements:
+- Complete, self-contained script
+- No external dependencies beyond standard library (or numpy/matplotlib if needed)
+- Clear comments
+- Proper error handling
+- Output results to stdout
+- Include validation checks
+
+SCRIPT:`;
+    const modelId = MODELS.coder.id;
+    const result = await this.plugin.ollama.generate(modelId, prompt, { numCtx: this.plugin.settings.numCtxLong });
+    const codeMatch = result.match(/```(?:python|javascript|js)?\s*\n([\s\S]*?)```/);
+    const code = codeMatch ? codeMatch[1] : result;
+    await this.plugin.provenance.record({
+      type: "simulation_script",
+      content: code,
+      sourceNote: opts.sourceNote || null,
+      model: modelId,
+      contentSource: CONTENT_SOURCES.CODE_GENERATED,
+      trustLevel: TRUST_LEVELS.UNVERIFIED,
+      metadata: { spec, language }
+    });
+    return { script: code, full: result };
+  }
+};
+var ResearchEngine = class {
+  constructor(plugin) {
+    this.plugin = plugin;
+  }
+  async research(topic, opts = {}) {
+    var _a;
+    let context = "";
+    if (this.plugin.settings.ragEnabled) {
+      const results = await this.plugin.rag.search(topic, 5);
+      if (results.length > 0) {
+        context = "RELEVANT VAULT NOTES:\n" + results.map(
+          (r) => `[${r.chunk.note}] (relevance ${(r.score * 100).toFixed(1)}%):
+${r.chunk.text}`
+        ).join("\n\n---\n\n");
+      }
+    }
+    const prompt = `You are a rigorous research assistant. Research the following topic and provide a comprehensive, well-cited synthesis.
+
+TOPIC:
+${topic}
+
+${context ? context + "\n" : ""}
+${opts.externalSources ? "EXTERNAL SOURCES: You may reference external knowledge, but clearly mark each claim with [VERIFY] if it needs verification.\n" : "EXTERNAL SOURCES: Do NOT use external sources. Base your answer only on the provided vault context and your internal knowledge, clearly marking any uncertain claims with [UNCERTAIN].\n"}
+
+Provide:
+1. Executive summary
+2. Key findings (each with citation to source note or [VERIFY]/[UNCERTAIN] marker)
+3. Evidence assessment
+4. Gaps and open questions
+5. References
+
+RESEARCH:`;
+    const modelId = MODELS.deep.id;
+    const result = await this.plugin.ollama.generate(modelId, prompt, { numCtx: this.plugin.settings.numCtxLong });
+    const citations = context ? ((_a = context.match(/\[([^\]]+\.md)\]/g)) == null ? void 0 : _a.map((c) => c.slice(1, -1))) || [] : [];
+    await this.plugin.provenance.record({
+      type: "research",
+      content: result,
+      sourceNote: opts.sourceNote || null,
+      model: modelId,
+      citations,
+      verified: !opts.externalSources,
+      verificationMethod: opts.externalSources ? "needs_verification" : "vault_context_only",
+      contentSource: opts.externalSources ? CONTENT_SOURCES.EXTERNAL_SOURCED : CONTENT_SOURCES.AI_GENERATED,
+      trustLevel: opts.externalSources ? TRUST_LEVELS.UNVERIFIED : citations.length > 0 ? TRUST_LEVELS.VERIFIED : TRUST_LEVELS.INFERRED,
+      metadata: { topic }
+    });
+    return { result, citations };
+  }
+};
+var VaultScholarPlugin = class extends Plugin {
+  async onload() {
+    await this.loadSettings();
+    this.assetsDir = path.join(this.app.vault.adapter.getBasePath(), ".obsidian", "plugins", PLUGIN_ID, "assets");
+    if (!fs.existsSync(this.assetsDir)) fs.mkdirSync(this.assetsDir, { recursive: true });
+    this.ollama = new OllamaClient(this);
+    this.modelManager = new ModelManager(this);
+    this.taskRouter = new TaskRouter(this);
+    this.provenance = new ProvenanceEngine(this);
+    this.snapshotManager = new SnapshotManager(this);
+    this.rag = new RAGEngine(this);
+    this.sandbox = new SandboxManager(this);
+    this.codeAuditor = new CodeAuditor(this);
+    this.mathPhysics = new MathPhysicsEngine(this);
+    this.simulation = new SimulationEngine(this);
+    this.research = new ResearchEngine(this);
+    this.trustBoundary = new TrustBoundary({
+      enabled: this.settings.trustEnforcement,
+      onDecision: (decision) => {
+        this.provenance.record({
+          type: "trust_decision",
+          content: `${decision.operation}: ${decision.allowed ? "ALLOWED" : "BLOCKED"} (${decision.level} vs ${decision.required})`,
+          contentSource: CONTENT_SOURCES.AI_GENERATED,
+          trustLevel: decision.level,
+          verifiedBy: "trust_boundary",
+          metadata: { decision }
+        });
+      }
+    });
+    this.researchMode = new ResearchMode({
+      createFetcher: () => async (url) => {
+        const res = await requestUrl({ url, throw: false });
+        if (res.status >= 400) throw new Error("HTTP " + res.status);
+        return res.text;
+      },
+      generate: (model, prompt, opts) => this.ollama.generate(model, prompt, opts),
+      modelId: MODELS.deep.id,
+      settings: {
+        searchProvider: this.settings.searchProvider,
+        searxngUrl: this.settings.searxngUrl,
+        searxngCategories: this.settings.searxngCategories,
+        searxngMaxResults: this.settings.searxngMaxResults,
+        maxSources: this.settings.maxSources,
+        maxSearchResults: this.settings.maxSearchResults,
+        numCtxLong: this.settings.numCtxLong
+      },
+      trustBoundary: this.trustBoundary
+    });
+    this.provenance.init();
+    this.snapshotManager.init();
+    this.rag.init();
+    this.sandbox.init();
+    this.workingMemory = "";
+    this.statusBarEl = this.addStatusBarItem();
+    this.updateStatusBar();
+    this.addRibbonIcon("brain-circuit", "Vault Scholar", () => {
+      this.openMainModal();
+    });
+    this.registerCommands();
+    this.addSettingTab(new VaultScholarSettingTab(this.app, this));
+    this.modelManager.ensureEmbeddingsLoaded();
+    if (this.settings.autoSnapshotBeforeRisky) {
+    }
+    new Notice("\u{1F989} Vault Scholar loaded");
+  }
+  onunload() {
+    new Notice("\u{1F989} Vault Scholar unloaded");
+  }
+  updateStatusBar() {
+    const model = this.modelManager.activeModel;
+    const short = model.split(":")[0].split("/").pop();
+    this.statusBarEl.setText(`\u{1F989} ${short}`);
+    this.statusBarEl.setAttribute("aria-label", `Vault Scholar \u2014 Active model: ${model}`);
+  }
+  registerCommands() {
+    this.addCommand({
+      id: "open-main",
+      name: "Open Vault Scholar",
+      callback: () => this.openMainModal()
+    });
+    this.addCommand({
+      id: "research",
+      name: "Research with citations",
+      callback: () => this.promptForInput("\u{1F52C} Research topic:", async (topic) => {
+        const { result, citations } = await this.research.research(topic);
+        this.showResultModal("Research Results", result, citations);
+      })
+    });
+    this.addCommand({
+      id: "research-mode",
+      name: "Research this (Research Mode)",
+      callback: () => this.promptForInput("\u{1F50E} Research this (Research Mode):", async (question) => {
+        if (!this.settings.internetResearch) {
+          new Notice("\u26A0\uFE0F Internet Research is OFF. Enable it in Settings \u2192 Vault Scholar.");
+          return;
+        }
+        if (!this.settings.researchModeEnabled) {
+          new Notice("\u26A0\uFE0F Research Mode is disabled in settings.");
+          return;
+        }
+        const stageNames = [];
+        const state = await this.researchMode.research(question, {
+          onStage: (name) => {
+            stageNames.push(name);
+            new Notice("\u{1F52C} Stage: " + name);
+          }
+        });
+        await this.provenance.record({
+          type: "research_mode",
+          content: state.answer || state.vaultProposal,
+          contentSource: CONTENT_SOURCES.EXTERNAL_SOURCED,
+          trustLevel: TRUST_LEVELS.VERIFIED,
+          citations: state.citations,
+          verificationMethod: "research_mode_pipeline",
+          metadata: { question, stages: stageNames, contradictions: state.contradictions.length }
+        });
+        this.showResultModal("Research Mode Results", state.vaultProposal, state.citations);
+      })
+    });
+    this.addCommand({
+      id: "gate-content",
+      name: "Gate active note with Evidence-Gated Knowledge",
+      callback: () => {
+        const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+        if (!view) {
+          new Notice("\u274C No active note");
+          return;
+        }
+        const report = EvidenceGate.validateNote(view.editor.getValue());
+        const text = "\u{1F6E1}\uFE0F EVIDENCE GATE REPORT\n=========================\n\nValid: " + (report.valid ? "\u2705 YES" : "\u274C NO") + "\nTotal claims: " + report.totalClaims + "\nAllowed: " + report.allowed + "\nBlocked: " + report.blocked + "\n\nOrigins:\n" + Object.entries(report.summary.origins || {}).map(([k, v]) => "  " + k + ": " + v).join("\n") + "\n\nTrust levels:\n" + Object.entries(report.summary.trust || {}).map(([k, v]) => "  " + k + ": " + v).join("\n") + (report.issues.length > 0 ? "\n\n\u{1F6AB} Blocked claims:\n" + report.issues.map((i) => "- " + i.text + "\n  \u2192 " + i.reason).join("\n") : "");
+        this.showResultModal("Evidence Gate Report", text);
+      }
+    });
+    this.addCommand({
+      id: "lint-evidence",
+      name: "Lint vault for evidence",
+      callback: async () => {
+        const files = this.app.vault.getMarkdownFiles();
+        let total = 0, blocked = 0, ok = 0;
+        const details = [];
+        for (const file of files) {
+          const content = await this.app.vault.cachedRead(file);
+          const report = EvidenceGate.validateNote(content);
+          total += report.totalClaims;
+          blocked += report.blocked;
+          if (report.blocked > 0) {
+            details.push(file.path + ": " + report.blocked + " blocked");
+          } else {
+            ok++;
+          }
+        }
+        const text = "\u{1F50D} VAULT EVIDENCE LINT\n======================\n\nFiles: " + files.length + "\nTotal claims: " + total + "\nBlocked: " + blocked + "\nFiles with issues: " + details.length + "\n\n" + (details.length > 0 ? details.join("\n") : "\u2705 No unsourced external claims detected");
+        this.showResultModal("Vault Evidence Lint", text);
+      }
+    });
+    this.addCommand({
+      id: "format-simulation",
+      name: "Format simulation result header",
+      callback: () => {
+        const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+        const header = EvidenceGate.simulationHeader(
+          "Unspecified model",
+          ["(none stated)"],
+          "(none stated)",
+          "Unspecified"
+        );
+        if (!view) {
+          this.showResultModal("Simulation Header Template", header);
+          new Notice("\u{1F4A1} No active note \u2014 header copied to result modal");
+          return;
+        }
+        const editor = view.editor;
+        const doc = editor.getDoc();
+        const cursor = doc.getCursor();
+        doc.replaceRange(header + "\n\n", cursor);
+        new Notice("\u2705 Simulation header inserted");
+      }
+    });
+    this.addCommand({
+      id: "derive-math",
+      name: "Derive math/physics step-by-step",
+      callback: () => this.promptForInput("\u2797 Problem to derive:", async (problem) => {
+        const result = await this.mathPhysics.derive(problem);
+        this.showResultModal("Derivation", result);
+      })
+    });
+    this.addCommand({
+      id: "analyze-patterns",
+      name: "Analyze patterns/symmetries/invariants",
+      callback: () => this.promptForInput("\u{1F50D} Input to analyze:", async (input) => {
+        const result = await this.mathPhysics.analyzePatterns(input);
+        this.showResultModal("Pattern Analysis", result);
+      })
+    });
+    this.addCommand({
+      id: "audit-code",
+      name: "Audit code for vulnerabilities",
+      callback: () => this.promptForInput("\u{1F4BB} Code to audit (paste code):", async (code) => {
+        const result = await this.codeAuditor.audit(code);
+        const staticText = result.staticFindings.length > 0 ? result.staticFindings.map((f) => `- [${f.severity.toUpperCase()}] ${f.name}: ${f.match}`).join("\n") : "- No static pattern matches";
+        this.showResultModal("Code Audit", `STATIC ANALYSIS:
+${staticText}
+
+AI ANALYSIS:
+${result.aiAnalysis}`);
+      })
+    });
+    this.addCommand({
+      id: "generate-sim-spec",
+      name: "Generate simulation specification",
+      callback: () => this.promptForInput("\u{1F3AF} Simulation description:", async (desc) => {
+        const spec = await this.simulation.generateSpec(desc);
+        this.showResultModal("Simulation Specification", spec);
+      })
+    });
+    this.addCommand({
+      id: "build-sim-script",
+      name: "Build simulation script from spec",
+      callback: () => this.promptForInput("\u{1F4DD} Paste simulation spec:", async (spec) => {
+        const { script, full } = await this.simulation.buildScript(spec);
+        this.showResultModal("Simulation Script", full, [], script);
+      })
+    });
+    this.addCommand({
+      id: "run-script-sandbox",
+      name: "Run script in sandbox",
+      callback: () => this.promptForInput("\u{1F3C3} Paste script to run in sandbox:", async (code) => {
+        var _a;
+        if (this.settings.scriptExecutionApproval) {
+          const approved = await this.confirmModal("Run in sandbox?", "This will execute the script in an isolated sandbox. Continue?");
+          if (!approved) {
+            new Notice("\u274C Script execution cancelled");
+            return;
+          }
+        }
+        const result = await this.sandbox.run(code);
+        this.showResultModal("Sandbox Output", `EXIT CODE: ${(_a = result.exitCode) != null ? _a : "N/A"}
+
+STDOUT:
+${result.stdout}
+
+STDERR:
+${result.stderr}`);
+      })
+    });
+    this.addCommand({
+      id: "semantic-search",
+      name: "Semantic search vault",
+      callback: () => this.promptForInput("\u{1F50E} Search query:", async (query) => {
+        const results = await this.rag.search(query);
+        if (results.length === 0) {
+          new Notice("No results found. Try indexing the vault first.");
+          return;
+        }
+        const text = results.map(
+          (r, i) => `### ${i + 1}. [${r.chunk.note}] (${(r.score * 100).toFixed(1)}%)
+${r.chunk.text}`
+        ).join("\n\n");
+        this.showResultModal("Semantic Search Results", text);
+      })
+    });
+    this.addCommand({
+      id: "index-vault",
+      name: "Index vault for semantic search",
+      callback: () => this.rag.indexVault()
+    });
+    this.addCommand({
+      id: "create-snapshot",
+      name: "Create vault snapshot",
+      callback: () => this.promptForInput("\u{1F4F8} Snapshot label:", async (label) => {
+        await this.snapshotManager.createSnapshot(label || "manual");
+      })
+    });
+    this.addCommand({
+      id: "list-snapshots",
+      name: "List snapshots",
+      callback: () => {
+        const snapshots = this.snapshotManager.listSnapshots();
+        if (snapshots.length === 0) {
+          new Notice("No snapshots yet");
+          return;
+        }
+        this.showResultModal("Snapshots", snapshots.map((s, i) => `${i + 1}. ${s}`).join("\n"));
+      }
+    });
+    this.addCommand({
+      id: "restore-snapshot",
+      name: "Restore snapshot",
+      callback: () => this.promptForInput("\u267B\uFE0F Snapshot name to restore:", async (name) => {
+        if (this.settings.vaultWriteApproval) {
+          const approved = await this.confirmModal("Restore snapshot?", `This will overwrite vault files with snapshot "${name}". Continue?`);
+          if (!approved) {
+            new Notice("\u274C Restore cancelled");
+            return;
+          }
+        }
+        await this.snapshotManager.restoreSnapshot(name);
+      })
+    });
+    this.addCommand({
+      id: "view-provenance",
+      name: "View provenance records",
+      callback: () => {
+        this.provenance.getAll().then((records) => {
+          if (records.length === 0) {
+            new Notice("No provenance records yet");
+            return;
+          }
+          const text = records.slice(-20).reverse().map(
+            (r) => `### ${r.timestamp}
+**Type:** ${r.type} | **Model:** ${r.model} | **Verified:** ${r.verified}
+${truncate(r.content, 300)}`
+          ).join("\n\n---\n\n");
+          this.showResultModal("Provenance Records", text);
+        });
+      }
+    });
+    this.addCommand({
+      id: "switch-model",
+      name: "Switch active model",
+      callback: () => {
+        const options = Object.entries(MODELS).map(([key, m]) => `${key}: ${m.id} (${m.role})`);
+        this.promptForInput("\u{1F9E0} Switch model (safe/deep/math/coder):", async (choice) => {
+          const key = choice.trim().toLowerCase();
+          if (MODELS[key]) {
+            await this.modelManager.switchTo(MODELS[key].id);
+          } else {
+            new Notice("Invalid model key. Use: safe, deep, math, coder");
+          }
+        });
+      }
+    });
+    this.addCommand({
+      id: "check-vram",
+      name: "Check loaded models (VRAM)",
+      callback: async () => {
+        const models = await this.ollama.ps();
+        if (models.length === 0) {
+          new Notice("No models currently loaded in VRAM");
+          return;
+        }
+        const text = models.map((m) => `- ${m.name} (${(m.size_vram / 1e9).toFixed(1)} GB VRAM)`).join("\n");
+        this.showResultModal("Loaded Models (VRAM)", text);
+      }
+    });
+    this.addCommand({
+      id: "classify-note",
+      name: "Classify current note trust level",
+      callback: () => {
+        const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+        if (!view) {
+          new Notice("\u274C No active note open");
+          return;
+        }
+        const content = view.editor.getValue();
+        const record = TrustClassifier.classify(content, {
+          source: CONTENT_SOURCES.USER_CREATED,
+          trustLevel: TRUST_LEVELS.TRUSTED,
+          verifiedBy: "user"
+        });
+        new Notice(`\u{1F6E1}\uFE0F Note classified: ${record.trustLevel} (${record.contentSource})`);
+        this.showResultModal(
+          "Trust Classification",
+          `TRUST LEVEL: ${record.trustLevel}
+CONTENT SOURCE: ${record.contentSource}
+CONFIDENCE: ${record.confidence}%
+VERIFIED: ${record.verified}
+VERIFIED BY: ${record.verifiedBy}
+HASH: ${record.hash.slice(0, 16)}\u2026`
+        );
+      }
+    });
+    this.addCommand({
+      id: "view-trust",
+      name: "View trust boundary status",
+      callback: () => {
+        const trail = this.trustBoundary.auditTrail();
+        const status = `TRUST BOUNDARY: ${this.settings.trustEnforcement ? "ACTIVE \u{1F6E1}\uFE0F" : "DISABLED"}
+THRESHOLD: ${this.settings.trustThreshold}
+
+DECISIONS LOGGED: ${trail.length}
+
+` + (trail.length > 0 ? trail.slice(-10).reverse().map(
+          (d) => `${d.timestamp} \u2014 ${d.operation}: ${d.allowed ? "\u2705 ALLOWED" : "\u{1F6AB} BLOCKED"} (${d.level} \u2192 required ${d.required})`
+        ).join("\n") : "No trust decisions yet.");
+        this.showResultModal("Trust Boundary Status", status);
+      }
+    });
+    this.addCommand({
+      id: "trust-audit",
+      name: "Run trust audit across vault",
+      callback: () => this.trustAudit()
+    });
+    this.addCommand({
+      id: "write-to-note",
+      name: "Write result to a new note",
+      callback: () => this.promptForInput("\u{1F4DD} Note title:", async (title) => {
+        if (this.settings.vaultWriteApproval) {
+          const approved = await this.confirmModal("Create note?", `Create note "${title}" in vault?`);
+          if (!approved) {
+            new Notice("\u274C Note creation cancelled");
+            return;
+          }
+        }
+        this.promptForInput("\u{1F4DD} Note content:", async (content) => {
+          const safeTitle = sanitizeFilename(title);
+          const filePath = `Vault Scholar/${safeTitle}.md`;
+          await this.app.vault.createFolder("Vault Scholar").catch(() => {
+          });
+          await this.app.vault.create(filePath, content);
+          new Notice(`\u2705 Note created: ${filePath}`);
+        });
+      })
+    });
+  }
+  // ============================================================
+  //  UI HELPERS
+  // ============================================================
+  promptForInput(placeholder, callback) {
+    const modal = new InputModal(this.app, placeholder, async (value) => {
+      try {
+        await callback(value);
+      } catch (e) {
+        new Notice(`\u274C Error: ${e.message}`);
+        console.error(e);
+      }
+    });
+    modal.open();
+  }
+  showResultModal(title, content, citations = [], code = null) {
+    const modal = new ResultModal(this.app, title, content, citations, code, this);
+    modal.open();
+  }
+  confirmModal(title, message) {
+    return new Promise((resolve) => {
+      const modal = new ConfirmModal(this.app, title, message, resolve);
+      modal.open();
+    });
+  }
+  openMainModal() {
+    const modal = new MainModal(this.app, this);
+    modal.open();
+  }
+  async loadSettings() {
+    this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+  }
+  async saveSettings() {
+    await this.saveData(this.settings);
+  }
+  async trustAudit() {
+    const files = this.app.vault.getMarkdownFiles();
+    let trusted = 0, verified = 0, inferred = 0, unverified = 0;
+    const breakdown = {};
+    for (const file of files) {
+      const content = await this.app.vault.cachedRead(file);
+      const record = TrustClassifier.classify(content, {
+        source: CONTENT_SOURCES.USER_CREATED,
+        trustLevel: TRUST_LEVELS.TRUSTED,
+        verifiedBy: "user"
+      });
+      switch (record.trustLevel) {
+        case TRUST_LEVELS.TRUSTED:
+          trusted++;
+          break;
+        case TRUST_LEVELS.VERIFIED:
+          verified++;
+          break;
+        case TRUST_LEVELS.INFERRED:
+          inferred++;
+          break;
+        default:
+          unverified++;
+          break;
+      }
+      breakdown[record.trustLevel] = (breakdown[record.trustLevel] || 0) + 1;
+    }
+    const text = `\u{1F512} TRUST AUDIT
+=============
+
+\u{1F4CA} Total notes: ${files.length}
+
+\u{1F6E1}\uFE0F TRUSTED:   ${trusted}
+\u2705 VERIFIED:  ${verified}
+\u{1F9E0} INFERRED:  ${inferred}
+\u26A0\uFE0F UNVERIFIED: ${unverified}
+
+Source breakdown:
+` + Object.entries(breakdown).map(([k, v]) => `  ${k}: ${v}`).join("\n") + `
+
+Trust boundary ${this.settings.trustEnforcement ? "ACTIVE" : "DISABLED"}`;
+    this.showResultModal("Trust Audit", text);
+  }
+};
+var InputModal = class extends Modal {
+  constructor(app, placeholder, onSubmit) {
+    super(app);
+    this.placeholder = placeholder;
+    this.onSubmit = onSubmit;
+  }
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.createEl("h3", { text: this.placeholder });
+    const textarea = contentEl.createEl("textarea", {
+      attr: { rows: "6", style: "width: 100%; font-family: monospace;" }
+    });
+    textarea.placeholder = "Type here...";
+    const btnRow = contentEl.createDiv({ cls: "vs-btn-row" });
+    const submitBtn = btnRow.createEl("button", { text: "Submit", cls: "mod-cta" });
+    const cancelBtn = btnRow.createEl("button", { text: "Cancel" });
+    submitBtn.addEventListener("click", () => {
+      const value = textarea.value.trim();
+      if (value) {
+        this.close();
+        this.onSubmit(value);
+      }
+    });
+    cancelBtn.addEventListener("click", () => this.close());
+    textarea.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
+        const value = textarea.value.trim();
+        if (value) {
+          this.close();
+          this.onSubmit(value);
+        }
+      }
+    });
+    textarea.focus();
+  }
+  onClose() {
+    this.contentEl.empty();
+  }
+};
+var ResultModal = class extends Modal {
+  constructor(app, title, content, citations, code, plugin) {
+    super(app);
+    this.title = title;
+    this.content = content;
+    this.citations = citations || [];
+    this.code = code;
+    this.plugin = plugin;
+  }
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.addClass("vs-result-modal");
+    contentEl.createEl("h2", { text: this.title });
+    if (this.citations.length > 0) {
+      const citeEl = contentEl.createDiv({ cls: "vs-citations" });
+      citeEl.createEl("strong", { text: "Citations: " });
+      citeEl.createEl("span", { text: this.citations.join(", ") });
+    }
+    const pre = contentEl.createEl("pre", { cls: "vs-result-content" });
+    pre.setText(this.content);
+    const btnRow = contentEl.createDiv({ cls: "vs-btn-row" });
+    if (this.code) {
+      const copyBtn2 = btnRow.createEl("button", { text: "\u{1F4CB} Copy Code" });
+      copyBtn2.addEventListener("click", () => {
+        navigator.clipboard.writeText(this.code);
+        new Notice("Code copied to clipboard");
+      });
+    }
+    const copyBtn = btnRow.createEl("button", { text: "\u{1F4CB} Copy Result" });
+    copyBtn.addEventListener("click", () => {
+      navigator.clipboard.writeText(this.content);
+      new Notice("Result copied to clipboard");
+    });
+    const saveBtn = btnRow.createEl("button", { text: "\u{1F4BE} Save to Note" });
+    saveBtn.addEventListener("click", async () => {
+      const safeTitle = sanitizeFilename(this.title);
+      const filePath = `Vault Scholar/${safeTitle}.md`;
+      await this.plugin.app.vault.createFolder("Vault Scholar").catch(() => {
+      });
+      await this.plugin.app.vault.create(filePath, this.content);
+      new Notice(`\u2705 Saved to ${filePath}`);
+      this.close();
+    });
+    const closeBtn = btnRow.createEl("button", { text: "Close" });
+    closeBtn.addEventListener("click", () => this.close());
+  }
+  onClose() {
+    this.contentEl.empty();
+  }
+};
+var ConfirmModal = class extends Modal {
+  constructor(app, title, message, onConfirm) {
+    super(app);
+    this.title = title;
+    this.message = message;
+    this.onConfirm = onConfirm;
+  }
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.createEl("h3", { text: this.title });
+    contentEl.createEl("p", { text: this.message });
+    const btnRow = contentEl.createDiv({ cls: "vs-btn-row" });
+    const yesBtn = btnRow.createEl("button", { text: "\u2705 Yes", cls: "mod-cta" });
+    const noBtn = btnRow.createEl("button", { text: "\u274C No" });
+    yesBtn.addEventListener("click", () => {
+      this.close();
+      this.onConfirm(true);
+    });
+    noBtn.addEventListener("click", () => {
+      this.close();
+      this.onConfirm(false);
+    });
+  }
+  onClose() {
+    this.contentEl.empty();
+  }
+};
+var MainModal = class extends Modal {
+  constructor(app, plugin) {
+    super(app);
+    this.plugin = plugin;
+  }
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.addClass("vs-main-modal");
+    contentEl.createEl("h2", { text: "\u{1F989} Vault Scholar" });
+    const status = contentEl.createDiv({ cls: "vs-status" });
+    status.createEl("p", { text: `Active Model: ${this.plugin.modelManager.activeModel}` });
+    status.createEl("p", { text: `Sandbox: ${this.plugin.settings.sandboxMode.toUpperCase()}` });
+    status.createEl("p", { text: `Internet Research: ${this.plugin.settings.internetResearch ? "ON" : "OFF"}` });
+    status.createEl("p", { text: `Vault Write Approval: ${this.plugin.settings.vaultWriteApproval ? "REQUIRED" : "AUTO"}` });
+    status.createEl("p", { text: `Script Execution Approval: ${this.plugin.settings.scriptExecutionApproval ? "REQUIRED" : "AUTO"}` });
+    status.createEl("p", { text: `Trust Boundary: ${this.plugin.settings.trustEnforcement ? "\u{1F6E1}\uFE0F ACTIVE" : "\u26A0\uFE0F DISABLED"} (${this.plugin.settings.trustThreshold})` });
+    const actions = contentEl.createDiv({ cls: "vs-actions" });
+    const actionsList = [
+      ["\u{1F52C} Research", "research"],
+      ["\u2797 Derive Math", "derive-math"],
+      ["\u{1F50D} Analyze Patterns", "analyze-patterns"],
+      ["\u{1F4BB} Audit Code", "audit-code"],
+      ["\u{1F3AF} Sim Spec", "generate-sim-spec"],
+      ["\u{1F4DD} Build Sim Script", "build-sim-script"],
+      ["\u{1F3C3} Run in Sandbox", "run-script-sandbox"],
+      ["\u{1F50E} Semantic Search", "semantic-search"],
+      ["\u{1F4F8} Snapshot", "create-snapshot"],
+      ["\u267B\uFE0F Restore", "restore-snapshot"],
+      ["\u{1F4DC} Provenance", "view-provenance"],
+      ["\u{1F6E1}\uFE0F Trust Status", "view-trust"],
+      ["\u{1F512} Trust Audit", "trust-audit"],
+      ["\u{1F52C} Research Mode", "research-mode"],
+      ["\u{1F6E1}\uFE0F Evidence Gate", "gate-content"],
+      ["\u{1F9E0} Switch Model", "switch-model"],
+      ["\u{1F9E0} Switch Model", "switch-model"]
+    ];
+    for (const [label, cmdId] of actionsList) {
+      const btn = actions.createEl("button", { text: label, cls: "vs-action-btn" });
+      btn.addEventListener("click", () => {
+        this.close();
+        this.app.commands.executeCommandById(`vault-scholar:${cmdId}`);
+      });
+    }
+    const closeBtn = contentEl.createEl("button", { text: "Close", cls: "vs-close-btn" });
+    closeBtn.addEventListener("click", () => this.close());
+  }
+  onClose() {
+    this.contentEl.empty();
+  }
+};
+var VaultScholarSettingTab = class extends PluginSettingTab {
+  constructor(app, plugin) {
+    super(app, plugin);
+    this.plugin = plugin;
+  }
+  display() {
+    const { containerEl } = this;
+    containerEl.empty();
+    containerEl.createEl("h2", { text: "\u{1F989} Vault Scholar Settings" });
+    containerEl.createEl("h3", { text: "\u{1F512} Security" });
+    new Setting(containerEl).setName("Safe Mode").setDesc("Default to safe model (Qwen3 8B) for everyday tasks").addToggle((t) => t.setValue(this.plugin.settings.safeMode).onChange(async (v) => {
+      this.plugin.settings.safeMode = v;
+      await this.plugin.saveSettings();
+    }));
+    new Setting(containerEl).setName("Internet Research").setDesc("Allow external sources in research (OFF by default)").addToggle((t) => t.setValue(this.plugin.settings.internetResearch).onChange(async (v) => {
+      this.plugin.settings.internetResearch = v;
+      await this.plugin.saveSettings();
+    }));
+    new Setting(containerEl).setName("Vault Write Approval").setDesc("Require approval before writing to vault").addToggle((t) => t.setValue(this.plugin.settings.vaultWriteApproval).onChange(async (v) => {
+      this.plugin.settings.vaultWriteApproval = v;
+      await this.plugin.saveSettings();
+    }));
+    new Setting(containerEl).setName("Script Execution Approval").setDesc("Require approval before running scripts in sandbox").addToggle((t) => t.setValue(this.plugin.settings.scriptExecutionApproval).onChange(async (v) => {
+      this.plugin.settings.scriptExecutionApproval = v;
+      await this.plugin.saveSettings();
+    }));
+    new Setting(containerEl).setName("Verify External Before Write").setDesc("Verify external sources before writing to vault").addToggle((t) => t.setValue(this.plugin.settings.verifyExternalBeforeWrite).onChange(async (v) => {
+      this.plugin.settings.verifyExternalBeforeWrite = v;
+      await this.plugin.saveSettings();
+    }));
+    containerEl.createEl("h3", { text: "\u{1F6E1}\uFE0F Trust Boundary" });
+    new Setting(containerEl).setName("Enable Trust Enforcement").setDesc("Enforce trust levels on vault operations. Unverified AI output cannot silently overwrite trusted content.").addToggle((t) => t.setValue(this.plugin.settings.trustEnforcement).onChange(async (v) => {
+      this.plugin.settings.trustEnforcement = v;
+      this.plugin.trustBoundary.enabled = v;
+      await this.plugin.saveSettings();
+    }));
+    new Setting(containerEl).setName("Trust Threshold").setDesc("Minimum trust level required for automatic operations").addDropdown((d) => d.addOption(TRUST_LEVELS.TRUSTED, "\u{1F6E1}\uFE0F TRUSTED \u2014 User verified only").addOption(TRUST_LEVELS.VERIFIED, "\u2705 VERIFIED \u2014 Cross-checked with citations").addOption(TRUST_LEVELS.INFERRED, "\u{1F9E0} INFERRED \u2014 Logically derived").addOption(TRUST_LEVELS.UNVERIFIED, "\u26A0\uFE0F UNVERIFIED \u2014 No checks").setValue(this.plugin.settings.trustThreshold).onChange(async (v) => {
+      this.plugin.settings.trustThreshold = v;
+      await this.plugin.saveSettings();
+    }));
+    new Setting(containerEl).setName("Show Trust Badges").setDesc("Display trust level badges in result modals and status bar").addToggle((t) => t.setValue(this.plugin.settings.trustDisplay).onChange(async (v) => {
+      this.plugin.settings.trustDisplay = v;
+      await this.plugin.saveSettings();
+    }));
+    containerEl.createEl("h3", { text: "\u{1F3D6}\uFE0F Sandbox" });
+    new Setting(containerEl).setName("Sandbox Mode").setDesc("Code execution isolation level").addDropdown((d) => d.addOption("python", "Python (subprocess isolation)").addOption("node", "Node (vm sandbox)").addOption("docker", "Docker (container isolation)").setValue(this.plugin.settings.sandboxMode).onChange(async (v) => {
+      this.plugin.settings.sandboxMode = v;
+      await this.plugin.saveSettings();
+    }));
+    containerEl.createEl("h3", { text: "\u{1F9E0} Models" });
+    new Setting(containerEl).setName("Active Model").setDesc("Current main task model").addDropdown((d) => {
+      for (const [key, m] of Object.entries(MODELS)) {
+        if (key !== "embedding") {
+          d.addOption(m.id, `${m.role} \u2014 ${m.id}`);
+        }
+      }
+      d.setValue(this.plugin.settings.activeModel);
+      d.onChange(async (v) => {
+        await this.plugin.modelManager.switchTo(v);
+      });
+    });
+    new Setting(containerEl).setName("Keep Embeddings Loaded").setDesc("Keep qwen3-embedding loaded in VRAM for instant RAG").addToggle((t) => t.setValue(this.plugin.settings.keepEmbeddingsLoaded).onChange(async (v) => {
+      this.plugin.settings.keepEmbeddingsLoaded = v;
+      await this.plugin.saveSettings();
+      if (v) this.plugin.modelManager.ensureEmbeddingsLoaded();
+    }));
+    containerEl.createEl("h3", { text: "\u{1F4CF} Context" });
+    new Setting(containerEl).setName("Context Window (tokens)").setDesc("Default context size. Increase for long derivations/code.").addSlider((s) => s.setLimits(2048, 16384, 1024).setValue(this.plugin.settings.numCtx).setDynamicTooltip().onChange(async (v) => {
+      this.plugin.settings.numCtx = v;
+      await this.plugin.saveSettings();
+    }));
+    new Setting(containerEl).setName("Long Context Window (tokens)").setDesc("Used for derivations, research, and large code files").addSlider((s) => s.setLimits(4096, 32768, 2048).setValue(this.plugin.settings.numCtxLong).setDynamicTooltip().onChange(async (v) => {
+      this.plugin.settings.numCtxLong = v;
+      await this.plugin.saveSettings();
+    }));
+    containerEl.createEl("h3", { text: "\u{1F4DC} Provenance" });
+    new Setting(containerEl).setName("Enable Provenance").setDesc("Record every claim, equation, and script with source, model, and timestamp").addToggle((t) => t.setValue(this.plugin.settings.provenanceEnabled).onChange(async (v) => {
+      this.plugin.settings.provenanceEnabled = v;
+      await this.plugin.saveSettings();
+    }));
+    containerEl.createEl("h3", { text: "\u{1F4F8} Snapshots" });
+    new Setting(containerEl).setName("Auto-snapshot before risky ops").setDesc("Create a snapshot before vault writes and script runs").addToggle((t) => t.setValue(this.plugin.settings.autoSnapshotBeforeRisky).onChange(async (v) => {
+      this.plugin.settings.autoSnapshotBeforeRisky = v;
+      await this.plugin.saveSettings();
+    }));
+    new Setting(containerEl).setName("Max snapshots").setDesc("Maximum number of snapshots to keep").addSlider((s) => s.setLimits(5, 50, 5).setValue(this.plugin.settings.snapshotMaxCount).setDynamicTooltip().onChange(async (v) => {
+      this.plugin.settings.snapshotMaxCount = v;
+      await this.plugin.saveSettings();
+    }));
+    containerEl.createEl("h3", { text: "\u{1F4DC} Evidence-Gated Knowledge" });
+    new Setting(containerEl).setName("Enable Evidence Gating").setDesc("Block external factual claims without a source from entering the vault (Section 9)").addToggle((t) => t.setValue(this.plugin.settings.evidenceGating).onChange(async (v) => {
+      this.plugin.settings.evidenceGating = v;
+      await this.plugin.saveSettings();
+    }));
+    containerEl.createEl("h3", { text: "\u{1F52C} Research Mode" });
+    new Setting(containerEl).setName("Enable Research Mode").setDesc("Allow the 13-stage research pipeline (Section 10)").addToggle((t) => t.setValue(this.plugin.settings.researchModeEnabled).onChange(async (v) => {
+      this.plugin.settings.researchModeEnabled = v;
+      await this.plugin.saveSettings();
+    }));
+    new Setting(containerEl).setName("Search Provider").setDesc("DuckDuckGo (zero-config) or SearXNG (user-specified endpoint \u2014 self-hosted OR third-party)").addDropdown((d) => d.addOption("duckduckgo", "DuckDuckGo (zero-config, no API key)").addOption("searxng", "SearXNG (user-specified endpoint)").setValue(this.plugin.settings.searchProvider).onChange(async (v) => {
+      this.plugin.settings.searchProvider = v;
+      await this.plugin.saveSettings();
+      this.display();
+    }));
+    new Setting(containerEl).setName("SearXNG URL").setDesc("Your SearXNG instance endpoint \u2014 self-hosted (e.g. http://localhost:8080) OR third-party (e.g. https://searx.be). Must support /search?format=json. User is responsible for the endpoint.").addText((t) => t.setPlaceholder("http://localhost:8080").setValue(this.plugin.settings.searxngUrl).setDisabled(this.plugin.settings.searchProvider !== "searxng").onChange(async (v) => {
+      this.plugin.settings.searxngUrl = v.trim();
+      await this.plugin.saveSettings();
+    }));
+    new Setting(containerEl).setName("SearXNG Categories").setDesc("SearXNG search categories (e.g. general, science)").addText((t) => t.setPlaceholder("general").setValue(this.plugin.settings.searxngCategories).onChange(async (v) => {
+      this.plugin.settings.searxngCategories = v.trim() || "general";
+      await this.plugin.saveSettings();
+    }));
+    new Setting(containerEl).setName("Max Sources").setDesc("Maximum number of sources to retrieve and analyze").addSlider((s) => s.setLimits(1, 20, 1).setValue(this.plugin.settings.maxSources).setDynamicTooltip().onChange(async (v) => {
+      this.plugin.settings.maxSources = v;
+      await this.plugin.saveSettings();
+    }));
+    new Setting(containerEl).setName("Max Search Results").setDesc("Maximum search results per query").addSlider((s) => s.setLimits(3, 30, 1).setValue(this.plugin.settings.maxSearchResults).setDynamicTooltip().onChange(async (v) => {
+      this.plugin.settings.maxSearchResults = v;
+      await this.plugin.saveSettings();
+    }));
+    containerEl.createEl("h3", { text: "\u{1F50E} RAG" });
+    new Setting(containerEl).setName("Enable RAG").setDesc("Semantic search and context retrieval from vault").addToggle((t) => t.setValue(this.plugin.settings.ragEnabled).onChange(async (v) => {
+      this.plugin.settings.ragEnabled = v;
+      await this.plugin.saveSettings();
+    }));
+    containerEl.createEl("h3", { text: "\u{1F999} Ollama" });
+    new Setting(containerEl).setName("Ollama Host").setDesc("Ollama API endpoint").addText((t) => t.setPlaceholder("http://localhost:11434").setValue(this.plugin.settings.ollamaHost).onChange(async (v) => {
+      this.plugin.settings.ollamaHost = v;
+      this.plugin.ollama.host = v;
+      await this.plugin.saveSettings();
+    }));
+    containerEl.createEl("h3", { text: "\u26A1 Actions" });
+    new Setting(containerEl).setName("Index vault for RAG").setDesc("Embed all notes for semantic search").addButton((b) => b.setButtonText("Index Vault").onClick(() => this.plugin.rag.indexVault()));
+    new Setting(containerEl).setName("Check loaded models").setDesc("View current VRAM usage").addButton((b) => b.setButtonText("Check VRAM").onClick(async () => {
+      const models = await this.plugin.ollama.ps();
+      if (models.length === 0) {
+        new Notice("No models currently loaded");
+        return;
+      }
+      new Notice(models.map((m) => `${m.name}: ${(m.size_vram / 1e9).toFixed(1)} GB`).join("\n"));
+    }));
+    new Setting(containerEl).setName("Create snapshot").setDesc("Backup vault to snapshot").addButton((b) => b.setButtonText("Snapshot Now").onClick(() => this.plugin.snapshotManager.createSnapshot("manual")));
+  }
+};
+module.exports = VaultScholarPlugin;

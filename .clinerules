@@ -1,0 +1,5 @@
+# TOOL CALLING FORMAT (MANDATORY)
+You MUST invoke tools using Anthropic-style XML tags.
+Example: <write_to_file><path>src/main.ts</path><content>...</content></write_to_file>
+DO NOT output JSON blocks like {"name": "write_to_file", "arguments": {...}}.
+DO NOT wrap tool calls in markdown code fences.
